@@ -1,0 +1,37 @@
+[package]
+name = "o3-jxl"
+version = "0.1.0"
+edition = "2024"
+description = "High-performance JPEG XL encoder/decoder using std::simd, targeting native and WebAssembly"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "o3_jxl"
+path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "o3-jxl"
+path = "src/main.rs"
+required-features = ["cli"]
+
+[features]
+default = ["cli", "parallel"]
+# Native CLI (clap). Disable when building the library for wasm.
+cli = ["dep:clap", "dep:jpeg-decoder"]
+# jxl-oxide + encoder rayon thread pool. Disable on wasm32 (no host threads).
+parallel = ["jxl-oxide/rayon", "dep:rayon"]
+wasm = ["dep:wasm-bindgen", "dep:console_error_panic_hook"]
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"], optional = true }
+jpeg-decoder = { version = "0.3", default-features = false, optional = true }
+console_error_panic_hook = { version = "0.1", optional = true }
+jxl-oxide = { git = "https://github.com/tirr-c/jxl-oxide.git", default-features = false, features = ["moxcms"] }
+png = "0.18"
+rayon = { version = "1.10", optional = true }
+thiserror = "2.0"
+wasm-bindgen = { version = "0.2", optional = true }
+
+[profile.release]
+lto = "thin"

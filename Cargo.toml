@@ -1,0 +1,32 @@
+[package]
+name = "mjxl"
+version = "0.1.0"
+edition = "2024"
+authors = ["Lyam Witherow"]
+description = "Motion JPEG XL: independent JPEG XL frames, GPU dirty rects, modular, VarDCT, and progressive rendering"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Lyamc/mjxl"
+
+[[bin]]
+name = "mjxl"
+path = "src/main.rs"
+
+[dependencies]
+bytemuck = { version = "1.19", features = ["derive"] }
+clap = { version = "4.5", features = ["derive"] }
+o3-jxl = { path = "third_party/o3-jxl", default-features = false, features = ["parallel"] }
+pollster = "0.4"
+thiserror = "2.0"
+# `wgc` pulls wgpu-core. On Windows and Linux that crate enables the Vulkan
+# hal; `dx12` / `metal` are the other native backends. Vulkan Video has no
+# JPEG XL profile, so this is compute, not a video session.
+wgpu = { version = "24", default-features = false, features = ["wgc", "wgsl"] }
+
+[target.'cfg(windows)'.dependencies]
+wgpu = { version = "24", default-features = false, features = ["dx12", "wgsl"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+wgpu = { version = "24", default-features = false, features = ["metal", "wgsl"] }
+
+[profile.release]
+lto = "thin"

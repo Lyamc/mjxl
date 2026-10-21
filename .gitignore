@@ -1,0 +1,12 @@
+target/
+*.mjxl
+*.avi
+*.mov
+*.mp4
+*.mj2
+*.y4m
+*.ppm
+*.pdb
+!samples/**
+.DS_Store
+
