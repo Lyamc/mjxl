@@ -260,6 +260,25 @@ Dirty rectangles on a clip that actually repeats pixels: 48 frames of `anim-icos
 | libjxl, per frame | 251703 | 2.560 | 0.9 | 2.0 | 40.61 | `djxl` PSNR |
 | JPEG 2000 | 537444 | 5.467 | 14.2 | 18.8 | 44.06 | `-q:v 5` |
 
+## WebAssembly demo
+
+`third_party/o3-jxl` builds to WASM with a `wasm-bindgen` progressive-decode
+session (`JxlSession`: `loadJxl`, `decodeTo`, `copyRgba`, `psnrVsFull`). A Trunk
+demo lives beside it:
+
+```bash
+cd third_party/o3-jxl
+trunk build --release
+trunk serve            # http://127.0.0.1:8081
+```
+
+The demo decodes any prefix of a `.jxl` locally in the browser, with a bundled
+`dice.jxl` sample and file upload. Only the **decoder** is exposed to JS today —
+the encoder is compiled into the WASM binary but has no `wasm-bindgen` bindings.
+
+Note: `mjxl` itself (the CLI / container / UDP streamer) is **not** WASM
+compatible — it depends on clap, wgpu, rayon, filesystem and sockets.
+
 ## Development
 
 Layout: `src/` is the mjxl CLI and container/temporal/GPU layers;

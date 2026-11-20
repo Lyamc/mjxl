@@ -1,0 +1,476 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>o3-jxl — progressive JPEG XL</title>
+  <link data-trunk rel="rust" data-wasm-opt="0" data-cargo-no-default-features data-cargo-features="wasm" />
+  <link data-trunk rel="copy-file" href="samples/jxl/dice.jxl" />
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #111;
+      --panel: #1a1a1a;
+      --line: #2a2a2a;
+      --text: #e8e8e8;
+      --muted: #9a9a9a;
+      --accent: #7cb3ff;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.45 ui-sans-serif, system-ui, sans-serif; }
+    main { max-width: 1120px; margin: 0 auto; padding: 1.25rem 1.25rem 3rem; }
+    h1 { font-size: 1.15rem; font-weight: 600; margin: 0 0 0.35rem; }
+    .lede { color: var(--muted); max-width: 46rem; margin: 0 0 1.1rem; }
+    code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.88em; }
+    .bar { display: flex; flex-wrap: wrap; gap: 0.5rem 0.75rem; align-items: center; margin-bottom: 1rem; }
+    .bar label.file, .bar select, .bar button, button.play {
+      background: var(--panel); border: 1px solid var(--line); border-radius: 6px;
+      color: var(--text); font: inherit;
+    }
+    .bar label.file {
+      display: inline-flex; align-items: center; gap: 0.45rem;
+      padding: 0.4rem 0.7rem; cursor: pointer;
+    }
+    .bar input[type="file"] { display: none; }
+    .bar select {
+      padding: 0.4rem 0.55rem; max-width: 18rem; cursor: pointer;
+    }
+    .status { color: var(--muted); font-variant-numeric: tabular-nums; }
+    .status.busy { color: var(--accent); }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+    @media (max-width: 800px) { .grid { grid-template-columns: 1fr; } }
+    figure {
+      margin: 0; background: var(--panel); border: 1px solid var(--line);
+      border-radius: 8px; overflow: hidden;
+    }
+    figure header {
+      display: flex; justify-content: space-between; gap: 0.5rem;
+      padding: 0.5rem 0.75rem; font-size: 0.8rem; color: var(--muted);
+      border-bottom: 1px solid var(--line);
+    }
+    .stage {
+      background: #000; height: 360px;
+      display: flex; align-items: center; justify-content: center;
+      overflow: hidden;
+    }
+    canvas {
+      display: block; max-width: 100%; max-height: 100%;
+      width: auto; height: auto; object-fit: contain;
+    }
+    .controls { margin-top: 1rem; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 0.9rem 1rem 1.1rem; }
+    .controls-head { display: flex; justify-content: space-between; align-items: center; gap: 0.75rem; margin-bottom: 0.55rem; }
+    .controls h2 { font-size: 0.85rem; font-weight: 600; margin: 0; }
+    button.play { padding: 0.3rem 0.8rem; cursor: pointer; }
+    button.play:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+    button.play:disabled { opacity: 0.45; cursor: default; }
+    .link-row {
+      display: flex; flex-wrap: wrap; align-items: center; gap: 0.55rem 1.1rem;
+      margin: 0 0 0.75rem; color: var(--muted);
+    }
+    .link-row label { display: inline-flex; align-items: center; gap: 0.4rem; }
+    .link-row input[type="number"] {
+      width: 5.8rem; background: var(--bg); border: 1px solid var(--line);
+      color: var(--text); border-radius: 6px; padding: 0.28rem 0.45rem; font: inherit;
+      font-variant-numeric: tabular-nums;
+    }
+    input[type="range"] { width: 100%; }
+    .meta { display: flex; flex-wrap: wrap; gap: 0.35rem 1.25rem; margin-top: 0.55rem; color: var(--muted); font-variant-numeric: tabular-nums; font-size: 0.9rem; }
+    .meta b { color: var(--text); font-weight: 600; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>o3-jxl progressive decode</h1>
+    <p class="lede">
+      Decode any prefix of a JPEG XL bitstream locally in the browser. More bytes
+      refine the <em>same</em> canvas (DC / groups / passes) — there is no
+      resolution ladder. Open a <code>.jxl</code> or pick one from the list.
+      Playback simulates a link: edit time or bitrate and the other follows.
+    </p>
+    <div class="bar">
+      <label class="file">Open
+        <input id="file" type="file" accept=".jxl,image/jxl" />
+      </label>
+      <select id="picker" aria-label="Image"></select>
+      <span id="status" class="status">Loading wasm…</span>
+    </div>
+    <div class="grid">
+      <figure>
+        <header><span>Full file</span><span id="srcMeta">—</span></header>
+        <div class="stage"><canvas id="src"></canvas></div>
+      </figure>
+      <figure>
+        <header><span>Decoded prefix</span><span id="recMeta">—</span></header>
+        <div class="stage"><canvas id="rec"></canvas></div>
+      </figure>
+    </div>
+    <div class="controls">
+      <div class="controls-head">
+        <h2>Bytes used</h2>
+      </div>
+      <div class="link-row">
+        <button id="play" class="play" type="button" disabled>Play</button>
+        <label>Time <input id="linkTime" type="number" min="0.2" step="0.1" value="5" /> s</label>
+        <label>Bitrate <input id="linkRate" type="number" min="1" step="0.1" value="" /> kbps</label>
+      </div>
+      <input id="bytes" type="range" min="32" max="32" value="32" disabled />
+      <div class="meta">
+        <span><b id="used">0</b> / <span id="total">0</span> bytes</span>
+        <span><b id="pct">0</b>% of stream</span>
+        <span>prefix <b id="bpp">0</b> bpp</span>
+        <span>PSNR vs full <b id="psnr">—</b> dB</span>
+      </div>
+    </div>
+  </main>
+  <script>
+    const BUNDLED = [
+      { label: "dice.jxl", url: "dice.jxl" },
+    ];
+
+    const el = (id) => document.getElementById(id);
+    const srcCanvas = el("src");
+    const recCanvas = el("rec");
+    const srcCtx = srcCanvas.getContext("2d");
+    const recCtx = recCanvas.getContext("2d");
+    const slider = el("bytes");
+    const playBtn = el("play");
+    const status = el("status");
+    const picker = el("picker");
+    const timeInput = el("linkTime");
+    const rateInput = el("linkRate");
+
+    let Session = null;
+    let session = null;
+    let streamLen = 0;
+    let headerBytes = 32;
+    let firstFrame = 32;
+    let pending = null;
+    let playing = false;
+    let playFromBytes = 0;
+    let playStart = 0;
+    let playRaf = null;
+    let linkTimeSec = 5;
+    let linkKbps = 0;
+    let nextId = 1;
+    let currentId = null;
+    const library = [];
+    const srcSlot = { data: null };
+    const recSlot = { data: null };
+
+    function setStatus(msg, busy) {
+      status.textContent = msg;
+      status.classList.toggle("busy", !!busy);
+    }
+
+    function waitBindings() {
+      if (window.wasmBindings && window.wasmBindings.JxlSession) {
+        return Promise.resolve(window.wasmBindings);
+      }
+      return new Promise((resolve) => {
+        window.addEventListener("TrunkApplicationStarted", () => {
+          resolve(window.wasmBindings);
+        }, { once: true });
+      });
+    }
+
+    function fmt(n) {
+      return n.toLocaleString("en-US");
+    }
+
+    function fmtKbps(v) {
+      if (!isFinite(v) || v <= 0) return "—";
+      return v >= 100 ? v.toFixed(0) : v.toFixed(1);
+    }
+
+    function fmtSec(v) {
+      if (!isFinite(v) || v <= 0) return "—";
+      return v >= 100 ? v.toFixed(0) : v.toFixed(1);
+    }
+
+    function bytesPerSec() {
+      return Math.max(linkKbps, 0.001) * 125;
+    }
+
+    function kbit() {
+      return streamLen > 0 ? (streamLen * 8) / 1000 : 0;
+    }
+
+    function numStr(v, hi) {
+      if (!isFinite(v) || v <= 0) return "";
+      return v >= hi ? String(Math.round(v)) : v.toFixed(1);
+    }
+
+    function syncFromTime() {
+      linkTimeSec = Math.max(Number(timeInput.value) || 0.2, 0.2);
+      if (streamLen > 0) {
+        linkKbps = kbit() / linkTimeSec;
+        rateInput.value = numStr(linkKbps, 100);
+      }
+    }
+
+    function syncFromRate() {
+      linkKbps = Math.max(Number(rateInput.value) || 1, 1);
+      if (streamLen > 0) {
+        linkTimeSec = kbit() / linkKbps;
+        timeInput.value = numStr(linkTimeSec, 100);
+      }
+    }
+
+    function applyStreamSize() {
+      linkTimeSec = Math.max(Number(timeInput.value) || 0.2, 0.2);
+      timeInput.value = numStr(linkTimeSec, 100);
+      if (streamLen > 0) {
+        linkKbps = kbit() / linkTimeSec;
+        rateInput.value = numStr(linkKbps, 100);
+      }
+    }
+
+    function paint(ctx, canvas, slot, w, h, copyFn) {
+      if (!w || !h) return;
+      if (!slot.data || slot.data.width !== w || slot.data.height !== h) {
+        canvas.width = w;
+        canvas.height = h;
+        slot.data = ctx.createImageData(w, h);
+      }
+      copyFn(new Uint8Array(slot.data.data.buffer, slot.data.data.byteOffset, slot.data.data.byteLength));
+      ctx.putImageData(slot.data, 0, 0);
+    }
+
+    function bppOf(bytes, w, h) {
+      const px = w * h;
+      if (!px || !bytes) return 0;
+      return (bytes * 8) / px;
+    }
+
+    function dimBpp(w, h, bytes) {
+      const bpp = bppOf(bytes, w, h);
+      return w + "×" + h + " · " + bpp.toFixed(3) + " bpp";
+    }
+
+    function updateMeta(n) {
+      const total = streamLen;
+      const pct = total ? (100 * n / total) : 0;
+      const w = session ? session.width : 0;
+      const h = session ? session.height : 0;
+      el("used").textContent = fmt(n);
+      el("total").textContent = fmt(total);
+      el("pct").textContent = pct.toFixed(1);
+      el("bpp").textContent = bppOf(n, w, h).toFixed(3);
+      if (w && h) {
+        el("srcMeta").textContent = dimBpp(w, h, streamLen);
+        el("recMeta").textContent = dimBpp(w, h, n);
+      }
+    }
+
+    function paintDecoded() {
+      const w = session.width;
+      const h = session.height;
+      paint(recCtx, recCanvas, recSlot, w, h, (buf) => session.copyRgba(buf));
+      el("recMeta").textContent = dimBpp(w, h, Number(slider.value));
+      const psnr = session.psnrVsFull();
+      el("psnr").textContent = psnr >= 98 ? "∞" : psnr.toFixed(2);
+    }
+
+    function paintFull() {
+      const w = session.width;
+      const h = session.height;
+      paint(srcCtx, srcCanvas, srcSlot, w, h, (buf) => session.copyFull(buf));
+      el("srcMeta").textContent = dimBpp(w, h, streamLen);
+    }
+
+    function renderPrefix() {
+      if (!session || !streamLen) return;
+      const n = Number(slider.value);
+      updateMeta(n);
+      const t0 = performance.now();
+      try {
+        session.decodeTo(n);
+      } catch (err) {
+        setStatus(String(err));
+        return;
+      }
+      paintDecoded();
+      if (!playing) {
+        const ms = performance.now() - t0;
+        if (ms >= 1) setStatus("Decode " + ms.toFixed(1) + " ms");
+      }
+    }
+
+    function updatePlayButton() {
+      playBtn.textContent = playing ? "Pause" : "Play";
+      playBtn.setAttribute("aria-pressed", playing ? "true" : "false");
+    }
+
+    function stopPlay() {
+      playing = false;
+      if (playRaf) {
+        cancelAnimationFrame(playRaf);
+        playRaf = null;
+      }
+      updatePlayButton();
+    }
+
+    function startPlay(fromStart) {
+      if (!session || !streamLen) return;
+      const cur = Number(slider.value);
+      if (fromStart || cur >= streamLen) {
+        slider.value = String(firstFrame);
+      }
+      playFromBytes = Number(slider.value);
+      playStart = performance.now();
+      playing = true;
+      playBtn.disabled = false;
+      updatePlayButton();
+      tickPlay();
+    }
+
+    function tickPlay() {
+      if (!playing) return;
+      const bps = bytesPerSec();
+      const elapsed = (performance.now() - playStart) / 1000;
+      const n = Math.min(streamLen, Math.round(playFromBytes + bps * elapsed));
+      slider.value = String(n);
+      renderPrefix();
+      const remain = Math.max(0, streamLen - n) / bps;
+      const total = Math.max(0, streamLen - playFromBytes) / bps;
+      const gone = total - remain;
+      setStatus(
+        "Receiving " + fmtSec(gone) + " / " + fmtSec(total) + " s · " + fmtKbps(linkKbps) + " kbps",
+        true
+      );
+      if (n >= streamLen) {
+        stopPlay();
+        setStatus("Received " + fmt(streamLen) + " bytes in " + fmtSec(total) + " s · " + fmtKbps(linkKbps) + " kbps");
+        return;
+      }
+      playRaf = requestAnimationFrame(tickPlay);
+    }
+
+    function togglePlay() {
+      if (!streamLen) return;
+      if (playing) {
+        stopPlay();
+        setStatus("Paused at " + fmt(Number(slider.value)) + " bytes");
+      } else {
+        startPlay(false);
+      }
+    }
+
+    function scheduleRender() {
+      if (playing) stopPlay();
+      updateMeta(Number(slider.value));
+      if (pending) return;
+      pending = requestAnimationFrame(() => {
+        pending = null;
+        renderPrefix();
+      });
+    }
+
+    function uniqueLabel(name) {
+      const labels = new Set(library.map((it) => it.label));
+      if (!labels.has(name)) return name;
+      let i = 2;
+      const dot = name.lastIndexOf(".");
+      const stem = dot > 0 ? name.slice(0, dot) : name;
+      const ext = dot > 0 ? name.slice(dot) : "";
+      while (labels.has(stem + " (" + i + ")" + ext)) i += 1;
+      return stem + " (" + i + ")" + ext;
+    }
+
+    function rebuildPicker(selectId) {
+      picker.innerHTML = "";
+      for (const item of library) {
+        const opt = document.createElement("option");
+        opt.value = item.id;
+        opt.textContent = item.label;
+        picker.appendChild(opt);
+      }
+      if (selectId) picker.value = selectId;
+    }
+
+    function addLibraryItem(item) {
+      library.push(item);
+      rebuildPicker(item.id);
+      return item;
+    }
+
+    async function loadBytes(bytes, label) {
+      stopPlay();
+      setStatus("Loading " + (label || "JXL") + "…", true);
+      await new Promise((r) => setTimeout(r, 20));
+      if (session && session.free) session.free();
+      session = new Session();
+      recSlot.data = null;
+      srcSlot.data = null;
+      const t0 = performance.now();
+      streamLen = session.loadJxl(bytes);
+      const ms = performance.now() - t0;
+      headerBytes = session.headerSize();
+      firstFrame = session.firstFrameSize() || headerBytes || 32;
+      slider.min = String(firstFrame);
+      slider.max = String(streamLen);
+      slider.value = String(firstFrame);
+      slider.disabled = false;
+      playBtn.disabled = false;
+      applyStreamSize();
+      paintFull();
+      setStatus("Loaded " + fmt(streamLen) + " bytes in " + ms.toFixed(0) + " ms");
+      startPlay(true);
+    }
+
+    async function loadItem(item) {
+      currentId = item.id;
+      picker.value = item.id;
+      if (item.bytes) {
+        await loadBytes(item.bytes, item.label);
+        return;
+      }
+      setStatus("Fetching " + item.label + "…", true);
+      const res = await fetch(item.url);
+      if (!res.ok) throw new Error("failed to fetch " + item.url);
+      const buf = new Uint8Array(await res.arrayBuffer());
+      item.bytes = buf;
+      await loadBytes(buf, item.label);
+    }
+
+    async function openFile(file) {
+      const buf = new Uint8Array(await file.arrayBuffer());
+      const item = addLibraryItem({
+        id: "local-" + (nextId++),
+        label: uniqueLabel(file.name),
+        bytes: buf,
+      });
+      await loadItem(item);
+    }
+
+    slider.addEventListener("input", scheduleRender);
+    playBtn.addEventListener("click", togglePlay);
+    el("file").addEventListener("change", (ev) => {
+      const file = ev.target.files && ev.target.files[0];
+      ev.target.value = "";
+      if (file) {
+        stopPlay();
+        openFile(file).catch((err) => setStatus(String(err)));
+      }
+    });
+    picker.addEventListener("change", () => {
+      const item = library.find((it) => it.id === picker.value);
+      if (!item || item.id === currentId) return;
+      stopPlay();
+      loadItem(item).catch((err) => setStatus(String(err)));
+    });
+    timeInput.addEventListener("input", syncFromTime);
+    rateInput.addEventListener("input", syncFromRate);
+
+    waitBindings()
+      .then((bindings) => {
+        Session = bindings.JxlSession;
+        for (const b of BUNDLED) {
+          addLibraryItem({ id: "bundled-" + (nextId++), label: b.label, url: b.url });
+        }
+        return loadItem(library[0]);
+      })
+      .catch((err) => setStatus(String(err)));
+  </script>
+</body>
+</html>
