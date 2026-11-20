@@ -30,7 +30,7 @@ pub use decoder::{
     write_pfm, write_pgm, write_pgx, write_png, write_png_depth, write_png_writer,
     write_png_writer_depth, write_ppm,
 };
-pub use encoder::{Encoder, PixelFormat, quality_to_distance};
+pub use encoder::{DEFAULT_EFFORT, Encoder, PixelFormat, quality_to_distance};
 pub use error::{Error, Result};
 pub use image::{DecodedFrame, ImageInfo};
 pub use progressive::{ProgressiveDecoder, psnr_rgb};

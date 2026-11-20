@@ -1,15 +1,21 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
+// Frame-parallel encoding allocates hundreds of short-lived buffers per
+// frame; a thread-local allocator keeps those off the global malloc lock.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use clap::{Parser, Subcommand, ValueEnum};
 use mjxl::compare::{self, Coding, CompareOpts};
 use mjxl::container::{self, FLAG_LOSSLESS, FLAG_PROGRESSIVE};
 use mjxl::decode::{self, DecodeOpts};
 use mjxl::gpu::{self, Backend};
 use mjxl::progressive;
+use mjxl::still;
 use mjxl::temporal::{self, SequenceOpts};
 use mjxl::y4m;
-use o3_jxl::Encoder;
+use o3_jxl::{Encoder, PixelFormat};
 
 #[derive(Parser)]
 #[command(
@@ -18,6 +24,9 @@ use o3_jxl::Encoder;
     about = "Motion JPEG XL: independent JXL frames, dirty rectangles, modular / VarDCT / progressive."
 )]
 struct Cli {
+    /// Emit machine-readable JSON on stdout (compare/bench/stills/info/verify).
+    #[arg(long, global = true)]
+    json: bool,
     #[command(subcommand)]
     command: Commands,
 }
@@ -31,7 +40,8 @@ enum Commands {
         /// Butteraugli distance. 0 = lossless modular. Default 1.
         #[arg(short = 'd', long, default_value_t = 1.0)]
         distance: f32,
-        #[arg(short = 'e', long, default_value_t = 7)]
+        /// Encoder effort 1..=10 (`cjxl -e`). Default 2. Effort 7 is the full path.
+        #[arg(short = 'e', long, default_value_t = o3_jxl::DEFAULT_EFFORT)]
         effort: u8,
         /// `vardct` (lossy RGB, JPEG-like) or `modular` (YCoCg-R + Gradient).
         #[arg(short = 'm', long, value_enum, default_value_t = StillCoding::Vardct)]
@@ -75,6 +85,9 @@ enum Commands {
         input: PathBuf,
         #[arg(short = 'd', long, default_value_t = 1.0)]
         distance: f32,
+        /// Encoder effort, same scale as `cjxl -e`. Default 2. Effort 7 is the full path.
+        #[arg(short = 'e', long, default_value_t = o3_jxl::DEFAULT_EFFORT)]
+        effort: u8,
         /// FFmpeg MJPEG `-q:v` (2=finest). 3 ≈ JPEG quality 90 on this encoder.
         #[arg(long, default_value_t = 3)]
         mjpeg_q: i32,
@@ -82,9 +95,48 @@ enum Commands {
         j2k_q: i32,
         #[arg(long)]
         work_dir: Option<PathBuf>,
+        /// Keep the temporary work directory instead of removing it.
+        #[arg(long)]
+        keep_work_dir: bool,
         /// Which still coder(s) to measure. Default both.
         #[arg(short = 'm', long, value_enum, default_value_t = CodingCli::Both)]
         coding: CodingCli,
+    },
+    /// In-process, median-of-N encode/decode bench for one still coder.
+    Bench {
+        input: PathBuf,
+        #[arg(short = 'd', long, default_value_t = 1.0)]
+        distance: f32,
+        #[arg(short = 'e', long, default_value_t = o3_jxl::DEFAULT_EFFORT)]
+        effort: u8,
+        #[arg(short = 'm', long, value_enum, default_value_t = StillCoding::Modular)]
+        coding: StillCoding,
+        #[arg(long, default_value_t = 5)]
+        repeats: u32,
+    },
+    /// Native JXL animation, using patches for repeated frames.
+    Anim {
+        input: PathBuf,
+        output: Option<PathBuf>,
+        #[arg(short = 'd', long, default_value_t = 1.0)]
+        distance: f32,
+        #[arg(short = 'e', long, default_value_t = o3_jxl::DEFAULT_EFFORT)]
+        effort: u8,
+    },
+    /// Encode → decode a Y4M in-process and report round-trip PSNR.
+    Verify {
+        input: PathBuf,
+        #[arg(short = 'd', long, default_value_t = 1.0)]
+        distance: f32,
+        #[arg(short = 'e', long, default_value_t = o3_jxl::DEFAULT_EFFORT)]
+        effort: u8,
+        #[arg(short = 'm', long, value_enum, default_value_t = StillCoding::Modular)]
+        coding: StillCoding,
+    },
+    /// Print a shell completion script to stdout.
+    Completions {
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
     },
     /// Still-image speed, bpp, and PSNR versus libjxl (`cjxl` / `djxl`).
     Stills {
@@ -92,8 +144,8 @@ enum Commands {
         /// Butteraugli distance. 0 encodes lossless modular only.
         #[arg(short = 'd', long, default_value_t = 1.0)]
         distance: f32,
-        /// Encoder effort, same scale as `cjxl -e`. Default 7.
-        #[arg(short = 'e', long, default_value_t = 7)]
+        /// Encoder effort, same scale as `cjxl -e`. 1 is fastest. Default 2.
+        #[arg(short = 'e', long, default_value_t = o3_jxl::DEFAULT_EFFORT)]
         effort: u8,
         /// Timed repetitions after one warmup. The median is reported.
         #[arg(long, default_value_t = 3)]
@@ -134,7 +186,9 @@ impl BackendCli {
 }
 
 fn main() -> mjxl::Result<()> {
-    match Cli::parse().command {
+    let cli = Cli::parse();
+    let json = cli.json;
+    match cli.command {
         Commands::Encode {
             input,
             output,
@@ -167,23 +221,108 @@ fn main() -> mjxl::Result<()> {
             output,
             backend,
         } => cmd_levels(input, output, backend.backend()),
-        Commands::Info { input } => cmd_info(input),
+        Commands::Info { input } => cmd_info(input, json),
+        Commands::Anim {
+            input,
+            output,
+            distance,
+            effort,
+        } => cmd_anim(input, output, distance, effort),
+        Commands::Verify {
+            input,
+            distance,
+            effort,
+            coding,
+        } => cmd_verify(input, distance, effort, coding, json),
+        Commands::Completions { shell } => {
+            clap_complete::generate(
+                shell,
+                &mut <Cli as clap::CommandFactory>::command(),
+                "mjxl",
+                &mut std::io::stdout(),
+            );
+            Ok(())
+        }
         Commands::Compare {
             input,
             distance,
+            effort,
             mjpeg_q,
             j2k_q,
             work_dir,
+            keep_work_dir,
             coding,
-        } => cmd_compare(input, distance, mjpeg_q, j2k_q, work_dir, coding),
+        } => cmd_compare(
+            input,
+            distance,
+            effort,
+            mjpeg_q,
+            j2k_q,
+            work_dir,
+            keep_work_dir,
+            coding,
+            json,
+        ),
+        Commands::Bench {
+            input,
+            distance,
+            effort,
+            coding,
+            repeats,
+        } => cmd_bench(input, distance, effort, coding, repeats, json),
         Commands::Stills {
             input,
             distance,
             effort,
             repeats,
             work_dir,
-        } => cmd_stills(input, distance, effort, repeats, work_dir),
+        } => cmd_stills(input, distance, effort, repeats, work_dir, json),
     }
+}
+
+fn json_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn num_or_null(v: Option<f64>) -> String {
+    v.map(|x| x.to_string()).unwrap_or_else(|| "null".into())
+}
+
+fn print_json_rows(rows: &[compare::Row], pixels: u64) {
+    let mut s = String::from("[");
+    for (i, r) in rows.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push_str(&format!(
+            "{{\"codec\":{},\"bytes\":{},\"bpp\":{:.6},\"encode_ms\":{:.3},\"decode_ms\":{:.3},\"enc_mps\":{:.3},\"dec_mps\":{:.3},\"psnr\":{},\"note\":{}}}",
+            json_str(&r.name),
+            r.bytes,
+            r.bytes as f64 * 8.0 / pixels.max(1) as f64,
+            r.encode_ms,
+            r.decode_ms,
+            (pixels as f64 / 1e6) / (r.encode_ms / 1000.0).max(1e-9),
+            (pixels as f64 / 1e6) / (r.decode_ms / 1000.0).max(1e-9),
+            num_or_null(r.psnr),
+            json_str(&r.note),
+        ));
+    }
+    s.push(']');
+    println!("{s}");
 }
 
 fn cmd_encode(
@@ -352,7 +491,7 @@ fn cmd_levels(input: PathBuf, output: Option<PathBuf>, backend: Backend) -> mjxl
     Ok(())
 }
 
-fn cmd_info(input: PathBuf) -> mjxl::Result<()> {
+fn cmd_info(input: PathBuf, json: bool) -> mjxl::Result<()> {
     let blob = std::fs::read(&input)?;
     let h = container::read_header(&blob)?;
     let payload: u64 = h.samples.iter().map(|s| s.size as u64).sum();
@@ -371,9 +510,54 @@ fn cmd_info(input: PathBuf) -> mjxl::Result<()> {
     if h.flags & FLAG_PROGRESSIVE != 0 {
         flag_s.push_str(" progressive");
     }
-    let shown = container::display_frames(&h).len();
+    let groups = container::display_frames(&h);
+    let shown = groups.len();
+    if json {
+        let mut s = format!(
+            "{{\"version\":{},\"width\":{},\"height\":{},\"frames\":{},\"samples\":{},\"fps\":{:.6},\"flags\":\"0x{:x}\",\"payload_bytes\":{},\"displayed\":[",
+            h.version,
+            h.width,
+            h.height,
+            shown,
+            h.nframes(),
+            h.fps(),
+            h.flags,
+            payload
+        );
+        for (fi, group) in groups.iter().enumerate() {
+            if fi > 0 {
+                s.push(',');
+            }
+            let dur: u32 = group.iter().map(|x| x.duration_ticks).sum();
+            s.push_str(&format!(
+                "{{\"index\":{},\"duration_ticks\":{},\"samples\":[",
+                fi, dur
+            ));
+            for (si, sample) in group.iter().enumerate() {
+                if si > 0 {
+                    s.push(',');
+                }
+                s.push_str(&format!(
+                    "{{\"offset\":{},\"size\":{},\"duration_ticks\":{},\"x\":{},\"y\":{},\"w\":{},\"h\":{},\"skip\":{}}}",
+                    sample.offset, sample.size, sample.duration_ticks, sample.x, sample.y,
+                    sample.w, sample.h, sample.size == 0
+                ));
+            }
+            s.push_str("]}");
+        }
+        s.push_str("]}");
+        println!("{s}");
+        return Ok(());
+    }
+    let human = if payload >= 1 << 20 {
+        format!("{:.1} MiB", payload as f64 / (1 << 20) as f64)
+    } else if payload >= 1 << 10 {
+        format!("{:.1} KiB", payload as f64 / (1 << 10) as f64)
+    } else {
+        format!("{payload} B")
+    };
     println!(
-        "v{} {}×{}  {} displayed / {} samples  {:.3} fps  flags=0x{:x} ({})  payload {} bytes",
+        "v{} {}×{}  {} displayed / {} samples  {:.3} fps  flags=0x{:x} ({})  payload {} bytes ({human})",
         h.version,
         h.width,
         h.height,
@@ -384,7 +568,7 @@ fn cmd_info(input: PathBuf) -> mjxl::Result<()> {
         flag_s.trim(),
         payload
     );
-    for (fi, group) in container::display_frames(&h).iter().enumerate() {
+    for (fi, group) in groups.iter().enumerate() {
         let dur: u32 = group.iter().map(|s| s.duration_ticks).sum();
         println!("  frame {fi} dur={dur} rects={}", group.len());
         for s in group {
@@ -398,18 +582,283 @@ fn cmd_info(input: PathBuf) -> mjxl::Result<()> {
     Ok(())
 }
 
+fn cmd_bench(
+    input: PathBuf,
+    distance: f32,
+    effort: u8,
+    coding: StillCoding,
+    repeats: u32,
+    json: bool,
+) -> mjxl::Result<()> {
+    let mut reader = y4m::open_path(&input)?;
+    let info = reader.info.clone();
+    let mut frames = Vec::new();
+    while let Some(rgb) = reader.next_rgb()? {
+        frames.push(rgb);
+    }
+    if frames.is_empty() {
+        return Err("no frames".into());
+    }
+    let pixels = frames.len() as u64 * info.width as u64 * info.height as u64;
+    let modular = matches!(coding, StillCoding::Modular) || distance <= 0.0;
+    let enc = Encoder::new()
+        .distance(distance)
+        .effort(effort)
+        .modular(Some(modular));
+    let opts = SequenceOpts {
+        intra: true,
+        closed_loop: false,
+        backend: Backend::Cpu,
+    };
+    let mut flags = if distance <= 0.0 { FLAG_LOSSLESS } else { 0 };
+    if modular {
+        flags |= container::FLAG_MODULAR;
+    }
+    let to_blob = |coded: &[temporal::Coded]| -> mjxl::Result<Vec<u8>> {
+        let mut blob = Vec::new();
+        container::write_coded(
+            &mut blob,
+            flags,
+            info.width,
+            info.height,
+            info.fps_num,
+            info.fps_den,
+            coded,
+        )?;
+        Ok(blob)
+    };
+    let dopts = DecodeOpts {
+        prefix: None,
+        backend: Backend::Cpu,
+    };
+
+    // Warm up both Rayon and the decoder before timing.
+    let warm = to_blob(&temporal::encode_sequence(
+        &enc,
+        info.width,
+        info.height,
+        &frames,
+        &opts,
+    )?)?;
+    let _ = decode::decode_rgb(&warm, &dopts)?;
+
+    let mut enc_ms = Vec::new();
+    let mut dec_ms = Vec::new();
+    let mut last_blob = warm;
+    for _ in 0..repeats.max(1) {
+        let t = Instant::now();
+        let coded = temporal::encode_sequence(&enc, info.width, info.height, &frames, &opts)?;
+        enc_ms.push(t.elapsed().as_secs_f64() * 1000.0);
+        last_blob = to_blob(&coded)?;
+        let t = Instant::now();
+        let _ = decode::decode_rgb(&last_blob, &dopts)?;
+        dec_ms.push(t.elapsed().as_secs_f64() * 1000.0);
+    }
+    let median = |v: &mut Vec<f64>| -> f64 {
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        v[v.len() / 2]
+    };
+    let em = median(&mut enc_ms);
+    let dm = median(&mut dec_ms);
+    let mp = |ms: f64| (pixels as f64 / 1e6) / (ms / 1000.0);
+    if json {
+        println!(
+            "{{\"coder\":\"{coding:?}\",\"distance\":{distance},\"effort\":{effort},\"pixels\":{pixels},\"repeats\":{repeats},\"encode_ms\":{em:.3},\"decode_ms\":{dm:.3},\"enc_mps\":{:.3},\"dec_mps\":{:.3},\"bytes\":{}}}",
+            mp(em),
+            mp(dm),
+            last_blob.len()
+        );
+        return Ok(());
+    }
+    println!("{coding:?} d={distance} e={effort} {pixels} pixels {repeats} reps");
+    println!(
+        "  encode {em:8.1} ms {:7.1} MP/s   decode {dm:8.1} ms {:7.1} MP/s   bytes {}",
+        mp(em),
+        mp(dm),
+        last_blob.len()
+    );
+    Ok(())
+}
+
+fn cmd_anim(
+    input: PathBuf,
+    output: Option<PathBuf>,
+    distance: f32,
+    effort: u8,
+) -> mjxl::Result<()> {
+    let mut reader = y4m::open_path(&input)?;
+    let info = reader.info.clone();
+    let mut frames = Vec::new();
+    while let Some(rgb) = reader.next_rgb()? {
+        frames.push(rgb);
+    }
+    if frames.is_empty() {
+        return Err("no frames".into());
+    }
+    let enc = Encoder::new()
+        .distance(distance)
+        .effort(effort)
+        .modular(Some(true));
+    let refs: Vec<(u32, &[u8])> = frames.iter().map(|f| (1u32, f.as_slice())).collect();
+    let t = Instant::now();
+    let blob = enc.encode_animation(
+        info.width,
+        info.height,
+        PixelFormat::Rgb,
+        info.fps_num,
+        info.fps_den,
+        0,
+        &refs,
+    )?;
+    let enc_ms = t.elapsed().as_secs_f64() * 1000.0;
+    let t = Instant::now();
+    let decoded = o3_jxl::Decoder::new()
+        .request_srgb(true)
+        .keep_linear(false)
+        .decode_bytes(&blob)?;
+    let dec_ms = t.elapsed().as_secs_f64() * 1000.0;
+    let ndec = decoded.len();
+    let psnrs: Vec<f64> = decoded
+        .iter()
+        .enumerate()
+        .take(frames.len())
+        .filter_map(|(i, f)| compare::psnr_rgb8(&frames[i], &still::rgba_to_rgb(&f.rgba)))
+        .collect();
+    let psnr = if psnrs.is_empty() {
+        f64::NAN
+    } else {
+        psnrs.iter().sum::<f64>() / psnrs.len() as f64
+    };
+    let out = output.unwrap_or_else(|| input.with_extension("jxl"));
+    std::fs::write(&out, &blob)?;
+    let pixels = frames.len() as f64 * info.width as f64 * info.height as f64;
+    println!(
+        "Native JXL animation: {} frames, {} bytes, {:.3} bpp, encode {:.1} ms ({:.1} MP/s), decode {:.1} ms ({:.1} MP/s), decoded {} frames → {}",
+        frames.len(),
+        blob.len(),
+        blob.len() as f64 * 8.0 / pixels,
+        enc_ms,
+        (pixels / 1e6) / (enc_ms / 1000.0).max(1e-9),
+        dec_ms,
+        (pixels / 1e6) / (dec_ms / 1000.0).max(1e-9),
+        ndec,
+        out.display()
+    );
+    println!("  RGB PSNR {psnr:.2} dB");
+    Ok(())
+}
+
+fn cmd_verify(
+    input: PathBuf,
+    distance: f32,
+    effort: u8,
+    coding: StillCoding,
+    json: bool,
+) -> mjxl::Result<()> {
+    let mut reader = y4m::open_path(&input)?;
+    let info = reader.info.clone();
+    let mut frames = Vec::new();
+    while let Some(rgb) = reader.next_rgb()? {
+        frames.push(rgb);
+    }
+    if frames.is_empty() {
+        return Err("no frames".into());
+    }
+    let modular = matches!(coding, StillCoding::Modular) || distance <= 0.0;
+    let enc = Encoder::new()
+        .distance(distance)
+        .effort(effort)
+        .modular(Some(modular));
+    let coded = temporal::encode_sequence(
+        &enc,
+        info.width,
+        info.height,
+        &frames,
+        &SequenceOpts {
+            intra: true,
+            closed_loop: false,
+            backend: Backend::Cpu,
+        },
+    )?;
+    let mut flags = if distance <= 0.0 { FLAG_LOSSLESS } else { 0 };
+    if modular {
+        flags |= container::FLAG_MODULAR;
+    }
+    let mut blob = Vec::new();
+    container::write_coded(
+        &mut blob,
+        flags,
+        info.width,
+        info.height,
+        info.fps_num,
+        info.fps_den,
+        &coded,
+    )?;
+    let decoded = decode::decode_rgb(
+        &blob,
+        &DecodeOpts {
+            prefix: None,
+            backend: Backend::Cpu,
+        },
+    )?
+    .frames;
+    let n = frames.len().min(decoded.len());
+    let psnrs: Vec<f64> = (0..n)
+        .filter_map(|i| compare::psnr_rgb8(&frames[i], &decoded[i]))
+        .collect();
+    let mean = if psnrs.is_empty() {
+        f64::NAN
+    } else {
+        psnrs.iter().sum::<f64>() / psnrs.len() as f64
+    };
+    let min = psnrs.iter().copied().fold(f64::INFINITY, f64::min);
+    if json {
+        println!(
+            "{{\"coder\":\"{coding:?}\",\"distance\":{distance},\"effort\":{effort},\"frames\":{n},\"bytes\":{},\"bpp\":{:.6},\"psnr_mean\":{},\"psnr_min\":{}}}",
+            blob.len(),
+            blob.len() as f64 * 8.0
+                / (frames.len() as f64 * info.width as f64 * info.height as f64),
+            mean,
+            min,
+        );
+    } else {
+        println!(
+            "Verified {n} frames {coding:?} d={distance} e={effort}: {} bytes, {:.3} bpp, PSNR mean {:.2} dB (min {:.2} dB)",
+            blob.len(),
+            blob.len() as f64 * 8.0
+                / (frames.len() as f64 * info.width as f64 * info.height as f64),
+            mean,
+            min
+        );
+    }
+    if n != frames.len() || n != decoded.len() {
+        return Err(format!(
+            "frame count mismatch: {} in, {} out",
+            frames.len(),
+            decoded.len()
+        )
+        .into());
+    }
+    Ok(())
+}
+
 fn cmd_compare(
     input: PathBuf,
     distance: f32,
+    effort: u8,
     mjpeg_q: i32,
     j2k_q: i32,
     work_dir: Option<PathBuf>,
+    keep_work_dir: bool,
     coding: CodingCli,
+    json: bool,
 ) -> mjxl::Result<()> {
+    let owned_dir = work_dir.is_none();
     let work_dir = work_dir
         .unwrap_or_else(|| std::env::temp_dir().join(format!("mjxl-{}", std::process::id())));
     let opts = CompareOpts {
         distance,
+        effort,
         mjpeg_q,
         j2k_q,
         work_dir: work_dir.clone(),
@@ -419,13 +868,23 @@ fn cmd_compare(
             CodingCli::Both => Coding::Both,
         },
     };
-    eprintln!("work dir {}", work_dir.display());
-    let (rows, pixels) = compare::run(&input, &opts)?;
-    println!(
-        "{:.3} MP  mjxl -d {distance}  mjpeg -q:v {mjpeg_q}  j2k -q:v {j2k_q}  coding={coding:?}",
-        pixels as f64 / 1e6
-    );
-    compare::print_table(&rows, pixels);
+    if !json {
+        eprintln!("work dir {}", work_dir.display());
+    }
+    let result = compare::run(&input, &opts);
+    if owned_dir && !keep_work_dir {
+        let _ = std::fs::remove_dir_all(&work_dir);
+    }
+    let (rows, pixels) = result?;
+    if json {
+        print_json_rows(&rows, pixels);
+    } else {
+        println!(
+            "{:.3} MP  mjxl -d {distance} -e {effort}  mjpeg -q:v {mjpeg_q}  j2k -q:v {j2k_q}  coding={coding:?}",
+            pixels as f64 / 1e6
+        );
+        compare::print_table(&rows, pixels);
+    }
     Ok(())
 }
 
@@ -435,7 +894,9 @@ fn cmd_stills(
     effort: u8,
     repeats: u32,
     work_dir: Option<PathBuf>,
+    json: bool,
 ) -> mjxl::Result<()> {
+    let owned_dir = work_dir.is_none();
     let work_dir = work_dir.unwrap_or_else(|| {
         std::env::temp_dir().join(format!("mjxl-stills-{}", std::process::id()))
     });
@@ -445,12 +906,22 @@ fn cmd_stills(
         repeats,
         work_dir: work_dir.clone(),
     };
-    eprintln!("work dir {}", work_dir.display());
-    let (rows, pixels) = compare::run_still(&input, &opts)?;
-    println!(
-        "{:.3} MP  still d={distance} effort={effort} repeats={repeats}",
-        pixels as f64 / 1e6
-    );
-    compare::print_table(&rows, pixels);
+    if !json {
+        eprintln!("work dir {}", work_dir.display());
+    }
+    let result = compare::run_still(&input, &opts);
+    if owned_dir {
+        let _ = std::fs::remove_dir_all(&work_dir);
+    }
+    let (rows, pixels) = result?;
+    if json {
+        print_json_rows(&rows, pixels);
+    } else {
+        println!(
+            "{:.3} MP  still d={distance} effort={effort} repeats={repeats}",
+            pixels as f64 / 1e6
+        );
+        compare::print_table(&rows, pixels);
+    }
     Ok(())
 }

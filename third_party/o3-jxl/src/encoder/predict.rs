@@ -758,7 +758,7 @@ pub fn split_res_tree(
 /// Greedy residual tree, at most 8 leaves. Squeeze properties 4, 5, 6, 9–11.
 #[allow(dead_code)]
 pub fn learn_res_tree(planes: &[(usize, &[u32], u32)], narrow: bool) -> ResTree {
-    const CAP: usize = 32_000;
+    const CAP: usize = 4_096;
     const MAX_LEAVES: usize = 8;
     let mut absn = Vec::new();
     let mut absw = Vec::new();

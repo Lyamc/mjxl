@@ -1,4 +1,4 @@
-//! VarDCT encode: 8×8 DCT, default dequant, ANS HF, cjxl e7 loop filter.
+//! VarDCT encode: 8×8 DCT, default dequant, ANS HF, effort-gated loop filter.
 
 use super::ans::{
     AnsHist, collect_ans_tokens_ctx_len, collect_ans_tokens_ctx_len_dist, write_ans_histograms_len,
@@ -173,6 +173,43 @@ impl BlockCtxModel {
     }
 }
 
+/// Which VarDCT tools an effort level runs. Each step adds tools; nothing
+/// below is turned back off. Effort 7 is the full set this encoder has
+/// (no butteraugli quant loop), so 7..=10 encode the same codestream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct VardctTools {
+    coeff_order: bool,
+    dct4: bool,
+    dct16: bool,
+    dct32: bool,
+    adaptive_quant: bool,
+    gaborish: bool,
+    cfl: bool,
+    block_ctx: bool,
+}
+
+fn vardct_tools(effort: u8) -> VardctTools {
+    let e = effort.clamp(1, 10);
+    VardctTools {
+        // Coefficient reordering. On bike.png at d=1 this is about 1% smaller
+        // for a few milliseconds, with the same RGB PSNR as flat 8×8.
+        coeff_order: e >= 2,
+        // 4×4 and 4×8 / 8×4. First block-size search.
+        dct4: e >= 3,
+        // 16×16 and 8×16 / 16×8.
+        dct16: e >= 4,
+        // Hare tools stay on the same step. Inverse Gaborish without the
+        // quant field raised bike.png from 2.59 bpp to 3.34 bpp at d=1.
+        gaborish: e >= 5,
+        adaptive_quant: e >= 5,
+        cfl: e >= 5,
+        // Clustering pays once those block types and the quant field exist.
+        block_ctx: e >= 6,
+        // 32×32. At d=1 the merge often loses, so effort 7 can match effort 6.
+        dct32: e >= 7,
+    }
+}
+
 pub fn encode_vardct_rgb(
     width: u32,
     height: u32,
@@ -183,7 +220,9 @@ pub fn encode_vardct_rgb(
     if pixels.len() != width as usize * height as usize * 3 {
         return Err(Error::Encode("VarDCT RGB buffer size mismatch".into()));
     }
-    let (gab, epf_iters) = vardct_loop_filter(distance, effort);
+    let tools = vardct_tools(effort);
+    let no_varblock = std::env::var_os("O3_NO_VARBLOCK").is_some();
+    let (gab, epf_iters) = vardct_loop_filter(distance, tools.gaborish);
     let params = ImageParams {
         width,
         height,
@@ -197,22 +236,36 @@ pub fn encode_vardct_rgb(
         vardct: true,
         gab,
         epf_iters,
+        save_as_reference: 0,
+        patches: None,
     };
 
     let bw = width.div_ceil(8) as usize;
     let bh = height.div_ceil(8) as usize;
     let pw = bw * 8;
     let ph = bh * 8;
+    let t_all = std::time::Instant::now();
+    let mut t_mark = t_all;
+    let tick = |name: &str, t_mark: &mut std::time::Instant| {
+        if std::env::var_os("O3_PROFILE").is_some() {
+            let ms = t_mark.elapsed().as_secs_f64() * 1000.0;
+            eprintln!("profile {name:16} {ms:8.1} ms");
+            *t_mark = std::time::Instant::now();
+        }
+    };
     let (mut x_pl, mut y_pl, mut b_pl) = srgb8_rgb_to_xyb_padded(width, height, pixels, pw, ph);
+    tick("xyb", &mut t_mark);
     // libjxl `InitialQuantField` runs on *pre-gaborish* XYB. Hare+ sets
     // `global_scale` from `0.39/d` (not the AQ-field median). Gab-off scales
     // the IQF distance by 0.62.
-    let (global_scale, quant_lf, base_hf_mul) = if effort >= 5 {
+    let (global_scale, quant_lf, base_hf_mul) = if tools.adaptive_quant {
         distance_to_quant_hare(distance)
     } else {
         distance_to_quant(distance, 0.79)
     };
-    let (mut hf_muls, mask1x1) = if effort >= 5 {
+    // The full-frame 1×1 mask is only read by block-size search and adaptive quant.
+    let block_search = tools.dct4 || ((tools.dct16 || tools.dct32) && !no_varblock);
+    let (mut hf_muls, mask1x1) = if tools.adaptive_quant {
         let iqf_d = if gab { distance } else { distance * 0.62 };
         let (qf, mask) = initial_quant_field(&x_pl, &y_pl, &b_pl, pw, ph, bw, bh, iqf_d);
         let inv_gs = 65536.0 / global_scale as f32;
@@ -221,19 +274,24 @@ pub fn encode_vardct_rgb(
             .map(|q| (q * inv_gs + 0.5).clamp(1.0, 256.0) as i32)
             .collect();
         (hf, mask)
-    } else {
+    } else if block_search {
         (vec![base_hf_mul; bw * bh], vec![1.0f32; pw * ph])
+    } else {
+        (vec![base_hf_mul; bw * bh], Vec::new())
     };
+    tick("quant-field", &mut t_mark);
     if gab {
         x_pl = gaborish_inverse_plane(&x_pl, pw, ph, GABORISH_INV_MUL_VARDCT[0]);
         y_pl = gaborish_inverse_plane(&y_pl, pw, ph, GABORISH_INV_MUL_VARDCT[1]);
         b_pl = gaborish_inverse_plane(&b_pl, pw, ph, GABORISH_INV_MUL_VARDCT[2]);
     }
-    let cfl = if effort >= 5 {
+    tick("gaborish", &mut t_mark);
+    let cfl = if tools.cfl {
         compute_cfl_maps(&x_pl, &y_pl, &b_pl, pw, bw, bh)
     } else {
         CflMaps::zeros(bw, bh)
     };
+    tick("cfl", &mut t_mark);
     let matrices = dct8_matrices();
     let qm_scale = [0.8f32, 1.0, 1.0]; // x_qm=3, b_qm=2
     // ac_inv for hf_mul = 1; per-block scale is applied at quantize time.
@@ -281,8 +339,30 @@ pub fn encode_vardct_rgb(
         &mut lf_q,
         &mut ac_q,
     );
+    tick("dct-quant", &mut t_mark);
     let mut acs = vec![ACS_DCT8; bw * bh];
-    if effort >= 5 {
+    // 8×8 token+loss cost is invariant for blocks that stay DCT8, and every
+    // strategy search below only asks it of those blocks. Compute it once.
+    let cost8 = if block_search {
+        compute_block_cost8(
+            bw,
+            bh,
+            pw,
+            [&x_pl, &y_pl, &b_pl],
+            &lf_q,
+            &ac_q,
+            &hf_muls,
+            gs,
+            lf_inv,
+            distance,
+            &mask1x1,
+            &cfl,
+        )
+    } else {
+        Vec::new()
+    };
+    tick("cost8", &mut t_mark);
+    if tools.dct4 {
         try_dct4x8(
             bw,
             bh,
@@ -297,6 +377,7 @@ pub fn encode_vardct_rgb(
             &mut lf_q,
             &mut ac_q,
             &mut acs,
+            &cost8,
             &mask1x1,
             &cfl,
         );
@@ -314,17 +395,19 @@ pub fn encode_vardct_rgb(
             &mut lf_q,
             &mut ac_q,
             &mut acs,
+            &cost8,
             &mask1x1,
             &cfl,
         );
     }
+    tick("dct4", &mut t_mark);
     let mut ac16 = [Vec::new(), Vec::new(), Vec::new()];
     let mut ac16_at = vec![u32::MAX; bw * bh];
     let mut ac32 = [Vec::new(), Vec::new(), Vec::new()];
     let mut ac32_at = vec![u32::MAX; bw * bh];
     let mut ac168 = [Vec::new(), Vec::new(), Vec::new()];
     let mut ac168_at = vec![u32::MAX; bw * bh];
-    if effort >= 5 && std::env::var_os("O3_NO_VARBLOCK").is_none() {
+    if !no_varblock && tools.dct16 {
         try_merge_dct16(
             bw,
             bh,
@@ -339,6 +422,7 @@ pub fn encode_vardct_rgb(
             &mut lf_q,
             &ac_q,
             &mut acs,
+            &cost8,
             &mut ac16,
             &mut ac16_at,
             &mask1x1,
@@ -363,6 +447,8 @@ pub fn encode_vardct_rgb(
             &mask1x1,
             &cfl,
         );
+    }
+    if !no_varblock && tools.dct32 {
         try_merge_dct32(
             bw,
             bh,
@@ -377,12 +463,14 @@ pub fn encode_vardct_rgb(
             &mut lf_q,
             &ac_q,
             &mut acs,
+            &cost8,
             &mut ac32,
             &mut ac32_at,
             &mask1x1,
             &cfl,
         );
     }
+    tick("varblock", &mut t_mark);
     if std::env::var_os("O3_ACS_STATS").is_some() {
         let mut n8 = 0u32;
         let mut n4 = 0u32;
@@ -408,19 +496,23 @@ pub fn encode_vardct_rgb(
             acs.len()
         );
     }
-    let bcm = if effort >= 5 {
+    let bcm = if tools.block_ctx {
         find_best_block_entropy_model(bw, bh, &acs, &hf_muls, distance)
     } else {
         BlockCtxModel::default_map()
     };
-    let coeff_orders = if effort >= 4 {
+    tick("block-ctx", &mut t_mark);
+    let coeff_orders = if tools.coeff_order {
         compute_coeff_orders(
             bw, bh, &acs, &ac_q, &ac16, &ac16_at, &ac32, &ac32_at, &ac168, &ac168_at,
         )
     } else {
         CoeffOrders::default()
     };
-    let (hf_hists, hf_map, hf_assign) = hist_from_hf_mixed(
+    tick("coeff-order", &mut t_mark);
+    // One token stream per group. Histogram and the pass writer share it so
+    // coefficient reorder runs once. Contexts stay raw until clustering.
+    let mut hf_tokens = hf_pass_tokens(
         width,
         height,
         bw,
@@ -436,6 +528,9 @@ pub fn encode_vardct_rgb(
         &hf_muls,
         &bcm,
     );
+    let (hf_hists, hf_map, hf_assign) = hist_from_hf_tokens(&hf_tokens, &bcm);
+    remap_hf_ctx(&mut hf_tokens, &hf_assign);
+    tick("ans-hist", &mut t_mark);
 
     let mut lf_vals = Vec::new();
     for plane in &lf_q {
@@ -480,84 +575,62 @@ pub fn encode_vardct_rgb(
             &mut w, width, height, bw, 0, &lf_q, &hf_muls, &acs, &lf_code, &cfl,
         );
         encode_hf_global(&mut w, &hf_hists, &hf_map, &coeff_orders, None, num_groups);
-        encode_pass_group_vardct(
+        encode_pass_tokens(
             &mut w,
-            width,
-            height,
-            bw,
-            0,
-            &ac_q,
-            &acs,
-            &ac16,
-            &ac16_at,
-            &ac32,
-            &ac32_at,
-            &ac168,
-            &ac168_at,
+            &hf_tokens[0].values,
+            &hf_tokens[0].ctxs,
             &hf_hists,
-            &hf_assign,
-            &coeff_orders,
             None,
-            &hf_muls,
-            &bcm,
         );
         sections.push(w.finish());
     } else {
         let mut w = BitWriter::with_capacity(1024);
         encode_lf_global_vardct(&mut w, global_scale, quant_lf, &lf_code, &bcm);
         sections.push(w.finish());
-        for g in 0..num_lf_groups {
+        let lf_sections = encode_sections(num_lf_groups, |g| {
             let mut w = BitWriter::with_capacity(4096);
             encode_lf_group_vardct(
                 &mut w, width, height, bw, g, &lf_q, &hf_muls, &acs, &lf_code, &cfl,
             );
-            sections.push(w.finish());
-        }
+            w.finish()
+        });
+        sections.extend(lf_sections);
         let mut w = BitWriter::with_capacity(1024);
         encode_hf_global(&mut w, &hf_hists, &hf_map, &coeff_orders, None, num_groups);
         sections.push(w.finish());
         let blocks_per_group = ((GROUP_DIM / 8) * (GROUP_DIM / 8)) as usize;
-        for g in 0..num_groups {
+        let pass_sections = encode_sections(num_groups, |g| {
             let mut w = BitWriter::with_capacity(blocks_per_group * 96 + 256);
-            encode_pass_group_vardct(
-                &mut w,
-                width,
-                height,
-                bw,
-                g,
-                &ac_q,
-                &acs,
-                &ac16,
-                &ac16_at,
-                &ac32,
-                &ac32_at,
-                &ac168,
-                &ac168_at,
-                &hf_hists,
-                &hf_assign,
-                &coeff_orders,
-                None,
-                &hf_muls,
-                &bcm,
-            );
-            sections.push(w.finish());
-        }
+            let tok = &hf_tokens[g as usize];
+            encode_pass_tokens(&mut w, &tok.values, &tok.ctxs, &hf_hists, None);
+            w.finish()
+        });
+        sections.extend(pass_sections);
     }
 
     let sizes: Vec<u32> = sections.iter().map(|s| s.len() as u32).collect();
     let mut out = BitWriter::with_capacity(64 + sizes.iter().map(|&s| s as usize).sum::<usize>());
-    write_image_header(&mut out, params);
+    write_image_header(&mut out, params.clone());
     write_frame_header(&mut out, params);
     write_toc(&mut out, &sizes);
     for s in &sections {
         out.append_bytes(s);
     }
+    tick("bitstream", &mut t_mark);
+    if std::env::var_os("O3_PROFILE").is_some() {
+        eprintln!(
+            "profile {:16} {:8.1} ms",
+            "total",
+            t_all.elapsed().as_secs_f64() * 1000.0
+        );
+    }
     Ok(out.finish())
 }
 
-/// cjxl: gab on for VarDCT at Hare+ when d > 0.5; EPF iters from `{0.7, 1.5, 4.0}`.
-fn vardct_loop_filter(distance: f32, effort: u8) -> (bool, u8) {
-    let gab = effort >= 5 && distance > 0.5;
+/// cjxl: gab on for VarDCT at Hare+ (effort ≥ 5) when d > 0.5.
+/// EPF iters follow distance thresholds `{0.7, 1.5, 4.0}` at every effort.
+fn vardct_loop_filter(distance: f32, gaborish: bool) -> (bool, u8) {
+    let gab = gaborish && distance > 0.5;
     let mut epf = 0u8;
     if distance >= 0.7 {
         epf += 1;
@@ -1015,7 +1088,147 @@ fn fuzzy_erosion(from: &[f32], fw: usize, fh: usize, distance: f32) -> Vec<f32> 
     to
 }
 
-/// libjxl `AdaptiveQuantizationMap` / `InitialQuantField` (scalar, full image).
+/// Run `f` on each row of `width` samples. Rows do not alias.
+fn par_rows_mut<F>(buf: &mut [f32], width: usize, f: F)
+where
+    F: Fn(usize, &mut [f32]) + Sync + Send,
+{
+    if width == 0 || buf.is_empty() {
+        return;
+    }
+    debug_assert_eq!(buf.len() % width, 0);
+    #[cfg(feature = "parallel")]
+    {
+        use rayon::prelude::*;
+        buf.par_chunks_mut(width)
+            .enumerate()
+            .for_each(|(y, row)| f(y, row));
+    }
+    #[cfg(not(feature = "parallel"))]
+    {
+        for (y, row) in buf.chunks_mut(width).enumerate() {
+            f(y, row);
+        }
+    }
+}
+
+/// Map `0..n` through `f`, in order. Uses the rayon pool when `parallel` is on.
+fn encode_sections<F>(n: u32, f: F) -> Vec<Vec<u8>>
+where
+    F: Fn(u32) -> Vec<u8> + Sync + Send,
+{
+    map_indexed(n, f)
+}
+
+fn map_indexed<T, F>(n: u32, f: F) -> Vec<T>
+where
+    T: Send,
+    F: Fn(u32) -> T + Sync + Send,
+{
+    #[cfg(feature = "parallel")]
+    {
+        use rayon::prelude::*;
+        return (0..n).into_par_iter().map(f).collect();
+    }
+    #[cfg(not(feature = "parallel"))]
+    {
+        (0..n).map(f).collect()
+    }
+}
+
+fn map_slice<T, U, F>(items: &[T], f: F) -> Vec<U>
+where
+    T: Sync,
+    U: Send,
+    F: Fn(&T) -> U + Sync + Send,
+{
+    #[cfg(feature = "parallel")]
+    {
+        use rayon::prelude::*;
+        return items.par_iter().map(f).collect();
+    }
+    #[cfg(not(feature = "parallel"))]
+    {
+        items.iter().map(f).collect()
+    }
+}
+
+/// `eval(by)` for `by` in `(0..limit).step_by(step)`, one vec per row, row order kept.
+fn collect_strided<T, F>(limit: usize, step: usize, eval: F) -> Vec<Vec<T>>
+where
+    T: Send,
+    F: Fn(usize) -> Vec<T> + Sync + Send,
+{
+    if step == 0 || limit == 0 {
+        return Vec::new();
+    }
+    #[cfg(feature = "parallel")]
+    {
+        use rayon::prelude::*;
+        return (0..limit).into_par_iter().step_by(step).map(eval).collect();
+    }
+    #[cfg(not(feature = "parallel"))]
+    {
+        let mut rows = Vec::with_capacity(limit.div_ceil(step));
+        for by in (0..limit).step_by(step) {
+            rows.push(eval(by));
+        }
+        rows
+    }
+}
+
+/// One block-row at a time. Each row owns its LF, AC, and ACS slots.
+fn par_block_rows<F>(
+    bw: usize,
+    bh: usize,
+    lf: &mut [Vec<i32>; 3],
+    ac: &mut [Vec<i32>; 3],
+    acs: &mut [u8],
+    row: F,
+) where
+    F: Fn(usize, [&mut [i32]; 3], [&mut [i32]; 3], &mut [u8]) + Sync + Send,
+{
+    if bw == 0 || bh == 0 {
+        return;
+    }
+    debug_assert_eq!(acs.len(), bw * bh);
+    #[cfg(feature = "parallel")]
+    {
+        use rayon::prelude::*;
+        let [lf0, lf1, lf2] = lf;
+        let [ac0, ac1, ac2] = ac;
+        lf0.par_chunks_mut(bw)
+            .zip(lf1.par_chunks_mut(bw))
+            .zip(lf2.par_chunks_mut(bw))
+            .zip(ac0.par_chunks_mut(bw * 63))
+            .zip(ac1.par_chunks_mut(bw * 63))
+            .zip(ac2.par_chunks_mut(bw * 63))
+            .zip(acs.par_chunks_mut(bw))
+            .enumerate()
+            .for_each(|(by, ((((((l0, l1), l2), a0), a1), a2), acs_row))| {
+                row(by, [l0, l1, l2], [a0, a1, a2], acs_row);
+            });
+    }
+    #[cfg(not(feature = "parallel"))]
+    {
+        let [lf0, lf1, lf2] = lf;
+        let [ac0, ac1, ac2] = ac;
+        for by in 0..bh {
+            let s = by * bw;
+            let e = s + bw;
+            let as_ = by * bw * 63;
+            let ae = as_ + bw * 63;
+            row(
+                by,
+                [&mut lf0[s..e], &mut lf1[s..e], &mut lf2[s..e]],
+                [&mut ac0[as_..ae], &mut ac1[as_..ae], &mut ac2[as_..ae]],
+                &mut acs[s..e],
+            );
+        }
+    }
+}
+
+/// libjxl `AdaptiveQuantizationMap` / `InitialQuantField`.
 /// Returns `(quant_field, mask1x1)`.
 #[allow(clippy::too_many_arguments)]
 fn initial_quant_field(
@@ -1032,58 +1245,61 @@ fn initial_quant_field(
     const MATCH_GAMMA: f32 = 0.019;
     const LIMIT: f32 = 0.2;
     let scale = AC_QUANT / distance.max(0.01);
-    let mut pre = vec![0.0f32; (pw / 4) * (ph / 4)];
-    let mut row = vec![0.0f32; pw];
-    for y in 0..ph {
-        let y1 = y.saturating_sub(1);
-        let y2 = (y + 1).min(ph - 1);
-        let row_y = &y_pl[y * pw..][..pw];
-        let row_t = &y_pl[y1 * pw..][..pw];
-        let row_b = &y_pl[y2 * pw..][..pw];
-        for x in 0..pw {
-            let x1 = x.saturating_sub(1);
-            let x2 = (x + 1).min(pw - 1);
-            let base = 0.25 * (row_b[x] + row_t[x] + row_y[x1] + row_y[x2]);
-            let gammac = ratio_gamma(row_y[x] + MATCH_GAMMA, false);
-            let mut diff = gammac * (row_y[x] - base);
-            diff = (diff * diff).min(LIMIT);
-            let v = masking_sqrt(diff);
-            if y % 4 == 0 {
-                row[x] = v;
-            } else {
-                row[x] += v;
+    let qw = pw / 4;
+    let qh = ph / 4;
+    let mut pre = vec![0.0f32; qw * qh];
+    // Groups of 4 rows are independent; addition order inside a group matches
+    // the old scalar scan (assign on the first row, then three adds).
+    par_rows_mut(&mut pre, qw, |out_y, dst| {
+        let mut row = vec![0.0f32; pw];
+        for dy in 0..4 {
+            let y = out_y * 4 + dy;
+            let y1 = y.saturating_sub(1);
+            let y2 = (y + 1).min(ph - 1);
+            let row_y = &y_pl[y * pw..][..pw];
+            let row_t = &y_pl[y1 * pw..][..pw];
+            let row_b = &y_pl[y2 * pw..][..pw];
+            for x in 0..pw {
+                let x1 = x.saturating_sub(1);
+                let x2 = (x + 1).min(pw - 1);
+                let base = 0.25 * (row_b[x] + row_t[x] + row_y[x1] + row_y[x2]);
+                let gammac = ratio_gamma(row_y[x] + MATCH_GAMMA, false);
+                let mut diff = gammac * (row_y[x] - base);
+                diff = (diff * diff).min(LIMIT);
+                let v = masking_sqrt(diff);
+                if dy == 0 {
+                    row[x] = v;
+                } else {
+                    row[x] += v;
+                }
             }
         }
-        if y % 4 == 3 {
-            let out_y = y / 4;
-            for x in 0..pw / 4 {
-                pre[out_y * (pw / 4) + x] =
-                    (row[x * 4] + row[x * 4 + 1] + row[x * 4 + 2] + row[x * 4 + 3]) * 0.25;
-            }
+        for x in 0..qw {
+            dst[x] = (row[x * 4] + row[x * 4 + 1] + row[x * 4 + 2] + row[x * 4 + 3]) * 0.25;
         }
-    }
-    let mut aq = fuzzy_erosion(&pre, pw / 4, ph / 4, distance);
+    });
+    let mut aq = fuzzy_erosion(&pre, qw, qh, distance);
+    debug_assert_eq!(aq.len(), bw * bh);
     let mut dampen = 1.0f32;
     if distance >= 2.0 {
         dampen = (1.0 - (distance - 2.0) / 12.0).max(0.0);
     }
     let mul = scale * dampen;
     let add = (1.0 - dampen) * 0.48 * scale;
-    for by in 0..bh {
+    par_rows_mut(&mut aq, bw, |by, aq_row| {
         let y = by * 8;
         for bx in 0..bw {
             let x = bx * 8;
-            let i = by * bw + bx;
-            let mut out_val = compute_mask(aq[i]);
+            let mut out_val = compute_mask(aq_row[bx]);
             out_val += hf_modulation(y_pl, pw, x, y, ph);
             out_val += gamma_modulation(x_pl, y_pl, pw, x, y);
             out_val += blue_modulation(x_pl, y_pl, b_pl, pw, x, y);
-            aq[i] = out_val.exp() * mul + add;
+            aq_row[bx] = out_val.exp() * mul + add;
         }
-    }
+    });
     // libjxl `mask1x1`: 1 / (log1p(|γ·laplacian|) + 0.01), used by EstimateEntropy.
     let mut mask = vec![1.0f32; pw * ph];
-    for y in 0..ph {
+    par_rows_mut(&mut mask, pw, |y, mrow| {
         let y1 = y.saturating_sub(1);
         let y2 = (y + 1).min(ph - 1);
         let row = &y_pl[y * pw..][..pw];
@@ -1095,9 +1311,9 @@ fn initial_quant_field(
             let base = 0.25 * (row_b[x] + row_t[x] + row[x1] + row[x2]);
             let gammac = ratio_gamma(row[x] + MATCH_GAMMA, false);
             let diff = (gammac * (row[x] - base)).abs().ln_1p();
-            mask[y * pw + x] = 1.0 / (diff + 0.01);
+            mrow[x] = 1.0 / (diff + 0.01);
         }
-    }
+    });
     (aq, mask)
 }
 
@@ -1288,6 +1504,13 @@ fn dct_quant_weights(params: &[f32], width: u32, height: u32) -> [f32; 64] {
     ret
 }
 
+struct Dct16Pick {
+    i00: usize,
+    hf_i: i32,
+    hf: [[i32; 252]; 3],
+    lf: [[i32; 4]; 3],
+}
+
 /// libjxl `enc_ac_strategy.cc`: merge 2×2 DCT8 into DCT16 when cheaper.
 #[allow(clippy::too_many_arguments)]
 fn try_merge_dct16(
@@ -1304,6 +1527,7 @@ fn try_merge_dct16(
     lf_q: &mut [Vec<i32>; 3],
     ac_q: &[Vec<i32>; 3],
     acs: &mut [u8],
+    cost8: &[f32],
     ac16: &mut [Vec<i32>; 3],
     ac16_at: &mut [u32],
     mask: &[f32],
@@ -1311,136 +1535,138 @@ fn try_merge_dct16(
 ) {
     let order = natural_order_16();
     let mat = dct16_matrices();
-    let mat8 = dct8_matrices();
-    let zigzag = dct8_zigzag_ac();
     let qm_scale = [0.8f32, 1.0, 1.0];
     // C: mul8x8 = k8x8mul2 + k8x8mul1 / (d + k8x8base), entropy_mul16X16 = 1.35
     let mul8 = 1.0 - 0.4 / (distance + 1.4);
     const MUL16: f32 = 1.35;
     let (cost_delta, zeros_mul, loss_mul) = entropy_scales(distance);
-    for by in (0..bh.saturating_sub(1)).step_by(2) {
-        for bx in (0..bw.saturating_sub(1)).step_by(2) {
-            let i00 = by * bw + bx;
-            let mut max_abs_y = 0i32;
-            let mut all8 = true;
-            for dy in 0..2 {
-                for dx in 0..2 {
-                    let i = (by + dy) * bw + (bx + dx);
-                    if acs[i] != ACS_DCT8 {
-                        all8 = false;
+    let rows = {
+        let acs: &[u8] = acs;
+        let hf_muls: &[i32] = hf_muls;
+        collect_strided(bh.saturating_sub(1), 2, |by| {
+            let mut wins = Vec::new();
+            for bx in (0..bw.saturating_sub(1)).step_by(2) {
+                let i00 = by * bw + bx;
+                let mut max_abs_y = 0i32;
+                let mut all8 = true;
+                for dy in 0..2 {
+                    for dx in 0..2 {
+                        let i = (by + dy) * bw + (bx + dx);
+                        if acs[i] != ACS_DCT8 {
+                            all8 = false;
+                        }
+                        for &v in &ac_q[1][i * 63..i * 63 + 63] {
+                            max_abs_y = max_abs_y.max(v.unsigned_abs() as i32);
+                        }
                     }
-                    for &v in &ac_q[1][i * 63..i * 63 + 63] {
-                        max_abs_y = max_abs_y.max(v.unsigned_abs() as i32);
+                }
+                if !all8 {
+                    continue;
+                }
+                // Nyquist-ish 8×8s (period-2 bars): DCT16 + EPF washes them even when the
+                // encoder-domain residual looks cheap.
+                if max_abs_y > 64 {
+                    continue;
+                }
+                let mut cost_sum = 0.0f32;
+                for dy in 0..2 {
+                    for dx in 0..2 {
+                        cost_sum += cost8[(by + dy) * bw + (bx + dx)];
                     }
                 }
-            }
-            if !all8 {
-                continue;
-            }
-            // Nyquist-ish 8×8s (period-2 bars): DCT16 + EPF washes them even when the
-            // encoder-domain residual looks cheap.
-            if max_abs_y > 64 {
-                continue;
-            }
-            let mut cost8 = 0.0f32;
-            for dy in 0..2 {
-                for dx in 0..2 {
-                    let i = (by + dy) * bw + (bx + dx);
-                    cost8 += estimate_8x8(
-                        planes,
-                        pw,
-                        bx + dx,
-                        by + dy,
-                        i,
-                        lf_q,
-                        ac_q,
-                        hf_muls[i],
-                        gs,
-                        mat8,
-                        qm_scale,
-                        &zigzag,
-                        lf_inv,
-                        cost_delta,
-                        zeros_mul,
-                        loss_mul,
-                        mask,
-                        cfl,
-                    );
+                cost_sum *= mul8;
+                // libjxl `AdjustQuantField` at d≤1.54: max of the covered 8×8s.
+                let hf_i = hf_muls[i00]
+                    .max(hf_muls[i00 + 1])
+                    .max(hf_muls[i00 + bw])
+                    .max(hf_muls[i00 + bw + 1]);
+                let hf = hf_i as f32;
+                let mut coefs = [
+                    dct16_fwd_from_plane(planes[0], pw, bx * 8, by * 8),
+                    dct16_fwd_from_plane(planes[1], pw, bx * 8, by * 8),
+                    dct16_fwd_from_plane(planes[2], pw, bx * 8, by * 8),
+                ];
+                let (kx, kb) = cfl.factors(bx, by);
+                apply_cfl_triple_lf(&mut coefs, kx, kb, 2, 16);
+                let mut hf16 = [[0i32; 252]; 3];
+                let mut spatial = coefs;
+                for c in 0..3 {
+                    // Match 8×8: t = orig * hf / (mat * 65536/gs * qm). Decoder rec is
+                    // q * mat * 65536 / (gs * hf) * qm; multiplying hf on both sides.
+                    let mul = (65536.0 / gs) * qm_scale[c];
+                    for (k, &(dx, dy)) in order[4..].iter().enumerate() {
+                        let idx = dx as usize * 16 + dy as usize;
+                        let m = mat[c][idx] * mul;
+                        let t = if m.abs() < 1e-12 {
+                            0.0
+                        } else {
+                            coefs[c][idx] / m * hf
+                        };
+                        hf16[c][k] = quantize_with_bias(t, quant_bias[c], quant_bias_num);
+                        spatial[c][idx] = coefs[c][idx] - hf16[c][k] as f32 * m / hf.max(1e-6);
+                    }
+                    spatial[c][0] = 0.0;
+                    spatial[c][1] = 0.0;
+                    spatial[c][16] = 0.0;
+                    spatial[c][17] = 0.0;
+                    idct16_2d(&mut spatial[c]);
+                    apply_spatial_mask(&mut spatial[c], mask, pw, bx * 8, by * 8, 16, 16);
                 }
-            }
-            cost8 *= mul8;
-            // libjxl `AdjustQuantField` at d≤1.54: max of the covered 8×8s.
-            let hf_i = hf_muls[i00]
-                .max(hf_muls[i00 + 1])
-                .max(hf_muls[i00 + bw])
-                .max(hf_muls[i00 + bw + 1]);
-            let hf = hf_i as f32;
-            let mut coefs = [
-                dct16_fwd_from_plane(planes[0], pw, bx * 8, by * 8),
-                dct16_fwd_from_plane(planes[1], pw, bx * 8, by * 8),
-                dct16_fwd_from_plane(planes[2], pw, bx * 8, by * 8),
-            ];
-            let (kx, kb) = cfl.factors(bx, by);
-            apply_cfl_triple_lf(&mut coefs, kx, kb, 2, 16);
-            let mut hf16 = [vec![0i32; 252], vec![0i32; 252], vec![0i32; 252]];
-            let mut spatial = coefs;
-            for c in 0..3 {
-                // Match 8×8: t = orig * hf / (mat * 65536/gs * qm). Decoder rec is
-                // q * mat * 65536 / (gs * hf) * qm; multiplying hf on both sides.
-                let mul = (65536.0 / gs) * qm_scale[c];
-                for (k, &(dx, dy)) in order[4..].iter().enumerate() {
-                    let idx = dx as usize * 16 + dy as usize;
-                    let m = mat[c][idx] * mul;
-                    let t = if m.abs() < 1e-12 {
-                        0.0
-                    } else {
-                        coefs[c][idx] / m * hf
-                    };
-                    hf16[c][k] = quantize_with_bias(t, quant_bias[c], quant_bias_num);
-                    spatial[c][idx] = coefs[c][idx] - hf16[c][k] as f32 * m / hf.max(1e-6);
+                let cost16 = hf_cost(&hf16[0], cost_delta, zeros_mul)
+                    + hf_cost(&hf16[1], cost_delta, zeros_mul)
+                    + hf_cost(&hf16[2], cost_delta, zeros_mul);
+                let qn = quant_norm_field(
+                    &[
+                        hf_muls[i00],
+                        hf_muls[i00 + 1],
+                        hf_muls[i00 + bw],
+                        hf_muls[i00 + bw + 1],
+                    ],
+                    gs,
+                );
+                let loss16 = eighth_loss(
+                    [&spatial[0][..], &spatial[1][..], &spatial[2][..]],
+                    256,
+                    qn,
+                    loss_mul,
+                );
+                if cost16 * MUL16 + loss16 >= cost_sum {
+                    continue;
                 }
-                spatial[c][0] = 0.0;
-                spatial[c][1] = 0.0;
-                spatial[c][16] = 0.0;
-                spatial[c][17] = 0.0;
-                idct16_2d(&mut spatial[c]);
-                apply_spatial_mask(&mut spatial[c], mask, pw, bx * 8, by * 8, 16, 16);
+                let mut lf = [[0i32; 4]; 3];
+                for c in 0..3 {
+                    let dc = dc_from_lowest_16(&coefs[c]);
+                    lf[c][0] = (dc[0] * lf_inv[c]).round() as i32;
+                    lf[c][1] = (dc[1] * lf_inv[c]).round() as i32;
+                    lf[c][2] = (dc[2] * lf_inv[c]).round() as i32;
+                    lf[c][3] = (dc[3] * lf_inv[c]).round() as i32;
+                }
+                wins.push(Dct16Pick {
+                    i00,
+                    hf_i,
+                    hf: hf16,
+                    lf,
+                });
             }
-            let cost16 = hf_cost(&hf16[0], cost_delta, zeros_mul)
-                + hf_cost(&hf16[1], cost_delta, zeros_mul)
-                + hf_cost(&hf16[2], cost_delta, zeros_mul);
-            let qn = quant_norm_field(
-                &[
-                    hf_muls[i00],
-                    hf_muls[i00 + 1],
-                    hf_muls[i00 + bw],
-                    hf_muls[i00 + bw + 1],
-                ],
-                gs,
-            );
-            let loss16 = eighth_loss(
-                [&spatial[0][..], &spatial[1][..], &spatial[2][..]],
-                256,
-                qn,
-                loss_mul,
-            );
-            if cost16 * MUL16 + loss16 >= cost8 {
-                continue;
-            }
+            wins
+        })
+    };
+    for row in rows {
+        for w in row {
             let slot = (ac16[0].len() / 252) as u32;
+            let i00 = w.i00;
             for c in 0..3 {
-                ac16[c].extend_from_slice(&hf16[c]);
-                let dc = dc_from_lowest_16(&coefs[c]);
-                lf_q[c][i00] = (dc[0] * lf_inv[c]).round() as i32;
-                lf_q[c][i00 + 1] = (dc[1] * lf_inv[c]).round() as i32;
-                lf_q[c][i00 + bw] = (dc[2] * lf_inv[c]).round() as i32;
-                lf_q[c][i00 + bw + 1] = (dc[3] * lf_inv[c]).round() as i32;
+                ac16[c].extend_from_slice(&w.hf[c]);
+                lf_q[c][i00] = w.lf[c][0];
+                lf_q[c][i00 + 1] = w.lf[c][1];
+                lf_q[c][i00 + bw] = w.lf[c][2];
+                lf_q[c][i00 + bw + 1] = w.lf[c][3];
             }
             acs[i00] = ACS_DCT16;
             acs[i00 + 1] = ACS_OCCUPIED;
             acs[i00 + bw] = ACS_OCCUPIED;
             acs[i00 + bw + 1] = ACS_OCCUPIED;
-            hf_muls[i00] = hf_i;
+            hf_muls[i00] = w.hf_i;
             ac16_at[i00] = slot;
         }
     }
@@ -1472,101 +1698,137 @@ fn try_merge_rect(
     let qm_scale = [0.8f32, 1.0, 1.0];
     let mul8 = 1.0 - 0.4 / (distance + 1.4);
     const MUL: f32 = 1.25;
-    // Vertical pairs → DCT16×8 (8×16 px).
-    for by in (0..bh.saturating_sub(1)).step_by(2) {
-        for bx in 0..bw {
-            let i0 = by * bw + bx;
-            if acs[i0] != ACS_DCT8 || acs[i0 + bw] != ACS_DCT8 {
-                continue;
+    // Vertical pairs → DCT16×8 (8×16 px). Tiles in one pass do not overlap.
+    let vertical = {
+        let acs: &[u8] = acs;
+        let hf_muls: &[i32] = hf_muls;
+        collect_strided(bh.saturating_sub(1), 2, |by| {
+            let mut wins = Vec::new();
+            for bx in 0..bw {
+                let i0 = by * bw + bx;
+                if acs[i0] != ACS_DCT8 || acs[i0 + bw] != ACS_DCT8 {
+                    continue;
+                }
+                let (cost8, max_abs) = pair_cost8(ac_q, bw, bx, by, true);
+                if max_abs > 64 {
+                    continue;
+                }
+                let hf_i = hf_muls[i0].max(hf_muls[i0 + bw]);
+                if let Some(pick) = try_one_rect(
+                    planes,
+                    pw,
+                    bx,
+                    by,
+                    8,
+                    16,
+                    ACS_DCT16X8,
+                    true,
+                    &order,
+                    mat,
+                    hf_i as f32,
+                    gs,
+                    qm_scale,
+                    quant_bias,
+                    quant_bias_num,
+                    lf_inv,
+                    cost8,
+                    mul8,
+                    MUL,
+                    distance,
+                    hf_i,
+                    i0,
+                    i0 + bw,
+                    mask,
+                    cfl,
+                ) {
+                    wins.push(pick);
+                }
             }
-            let (cost8, max_abs) = pair_cost8(ac_q, bw, bx, by, true);
-            if max_abs > 64 {
-                continue;
+            wins
+        })
+    };
+    commit_rect_rows(vertical, lf_q, acs, ac168, ac168_at, hf_muls);
+    // Horizontal pairs → DCT8×16 (16×8 px), after vertical commits.
+    let horizontal = {
+        let acs: &[u8] = acs;
+        let hf_muls: &[i32] = hf_muls;
+        collect_strided(bh, 1, |by| {
+            let mut wins = Vec::new();
+            for bx in (0..bw.saturating_sub(1)).step_by(2) {
+                let i0 = by * bw + bx;
+                if acs[i0] != ACS_DCT8 || acs[i0 + 1] != ACS_DCT8 {
+                    continue;
+                }
+                let (cost8, max_abs) = pair_cost8(ac_q, bw, bx, by, false);
+                if max_abs > 64 {
+                    continue;
+                }
+                let hf_i = hf_muls[i0].max(hf_muls[i0 + 1]);
+                if let Some(pick) = try_one_rect(
+                    planes,
+                    pw,
+                    bx,
+                    by,
+                    16,
+                    8,
+                    ACS_DCT8X16,
+                    false,
+                    &order,
+                    mat,
+                    hf_i as f32,
+                    gs,
+                    qm_scale,
+                    quant_bias,
+                    quant_bias_num,
+                    lf_inv,
+                    cost8,
+                    mul8,
+                    MUL,
+                    distance,
+                    hf_i,
+                    i0,
+                    i0 + 1,
+                    mask,
+                    cfl,
+                ) {
+                    wins.push(pick);
+                }
             }
-            let hf_i = hf_muls[i0].max(hf_muls[i0 + bw]);
-            let hf = hf_i as f32;
-            if !try_one_rect(
-                planes,
-                pw,
-                bx,
-                by,
-                8,
-                16,
-                ACS_DCT16X8,
-                true,
-                &order,
-                mat,
-                hf,
-                gs,
-                qm_scale,
-                quant_bias,
-                quant_bias_num,
-                lf_inv,
-                cost8,
-                mul8,
-                MUL,
-                distance,
-                lf_q,
-                acs,
-                ac168,
-                ac168_at,
-                bw,
-                i0,
-                &[i0 + bw],
-                mask,
-                cfl,
-            ) {
-                continue;
+            wins
+        })
+    };
+    commit_rect_rows(horizontal, lf_q, acs, ac168, ac168_at, hf_muls);
+}
+
+struct RectPick {
+    i0: usize,
+    extra: usize,
+    kind: u8,
+    hf_i: i32,
+    hf: [[i32; 126]; 3],
+    lf: [[i32; 2]; 3],
+}
+
+fn commit_rect_rows(
+    rows: Vec<Vec<RectPick>>,
+    lf_q: &mut [Vec<i32>; 3],
+    acs: &mut [u8],
+    ac168: &mut [Vec<i32>; 3],
+    ac168_at: &mut [u32],
+    hf_muls: &mut [i32],
+) {
+    for row in rows {
+        for p in row {
+            let slot = (ac168[0].len() / 126) as u32;
+            for c in 0..3 {
+                ac168[c].extend_from_slice(&p.hf[c]);
+                lf_q[c][p.i0] = p.lf[c][0];
+                lf_q[c][p.extra] = p.lf[c][1];
             }
-            hf_muls[i0] = hf_i;
-        }
-    }
-    // Horizontal pairs → DCT8×16 (16×8 px).
-    for by in 0..bh {
-        for bx in (0..bw.saturating_sub(1)).step_by(2) {
-            let i0 = by * bw + bx;
-            if acs[i0] != ACS_DCT8 || acs[i0 + 1] != ACS_DCT8 {
-                continue;
-            }
-            let (cost8, max_abs) = pair_cost8(ac_q, bw, bx, by, false);
-            if max_abs > 64 {
-                continue;
-            }
-            let hf_i = hf_muls[i0].max(hf_muls[i0 + 1]);
-            let hf = hf_i as f32;
-            if try_one_rect(
-                planes,
-                pw,
-                bx,
-                by,
-                16,
-                8,
-                ACS_DCT8X16,
-                false,
-                &order,
-                mat,
-                hf,
-                gs,
-                qm_scale,
-                quant_bias,
-                quant_bias_num,
-                lf_inv,
-                cost8,
-                mul8,
-                MUL,
-                distance,
-                lf_q,
-                acs,
-                ac168,
-                ac168_at,
-                bw,
-                i0,
-                &[i0 + 1],
-                mask,
-                cfl,
-            ) {
-                hf_muls[i0] = hf_i;
-            }
+            acs[p.i0] = p.kind;
+            acs[p.extra] = ACS_OCCUPIED;
+            ac168_at[p.i0] = slot;
+            hf_muls[p.i0] = p.hf_i;
         }
     }
 }
@@ -1613,16 +1875,12 @@ fn try_one_rect(
     mul8: f32,
     mul_rect: f32,
     distance: f32,
-    lf_q: &mut [Vec<i32>; 3],
-    acs: &mut [u8],
-    ac168: &mut [Vec<i32>; 3],
-    ac168_at: &mut [u32],
-    bw: usize,
+    hf_i: i32,
     i0: usize,
-    extra: &[usize],
+    extra: usize,
     mask: &[f32],
     cfl: &CflMaps,
-) -> bool {
+) -> Option<RectPick> {
     let mut coefs = [
         dct_rect_from_plane(planes[0], pw, bx * 8, by * 8, w, h),
         dct_rect_from_plane(planes[1], pw, bx * 8, by * 8, w, h),
@@ -1647,7 +1905,7 @@ fn try_one_rect(
             }
         }
     }
-    let mut hf16 = [vec![0i32; 126], vec![0i32; 126], vec![0i32; 126]];
+    let mut hf16 = [[0i32; 126]; 3];
     let mut spatial = [coefs[0].clone(), coefs[1].clone(), coefs[2].clone()];
     for c in 0..3 {
         let mul = (65536.0 / gs) * qm_scale[c];
@@ -1698,24 +1956,22 @@ fn try_one_rect(
         loss_mul,
     );
     if cost * mul_rect + loss >= cost8 * mul8 {
-        return false;
+        return None;
     }
-    let slot = (ac168[0].len() / 126) as u32;
+    let mut lf = [[0i32; 2]; 3];
     for c in 0..3 {
-        ac168[c].extend_from_slice(&hf16[c]);
         let dc = dc_from_lowest_rect(&coefs[c], w, h);
-        lf_q[c][i0] = (dc.0 * lf_inv[c]).round() as i32;
-        if extra.len() == 1 {
-            lf_q[c][extra[0]] = (dc.1 * lf_inv[c]).round() as i32;
-        }
+        lf[c][0] = (dc.0 * lf_inv[c]).round() as i32;
+        lf[c][1] = (dc.1 * lf_inv[c]).round() as i32;
     }
-    acs[i0] = kind;
-    for &e in extra {
-        acs[e] = ACS_OCCUPIED;
-    }
-    ac168_at[i0] = slot;
-    let _ = bw;
-    true
+    Some(RectPick {
+        i0,
+        extra,
+        kind,
+        hf_i,
+        hf: hf16,
+        lf,
+    })
 }
 
 fn dc_from_lowest_rect(coeff: &[f32], w: usize, h: usize) -> (f32, f32) {
@@ -1730,6 +1986,13 @@ fn dc_from_lowest_rect(coeff: &[f32], w: usize, h: usize) -> (f32, f32) {
         let b = coeff[1] * s1;
         (a + b, a - b)
     }
+}
+
+struct Dct32Pick {
+    i00: usize,
+    hf_i: i32,
+    hf: [[i32; 1008]; 3],
+    lf: [[i32; 16]; 3],
 }
 
 /// libjxl `entropy_mul32X32 = 1.5`.
@@ -1748,6 +2011,7 @@ fn try_merge_dct32(
     lf_q: &mut [Vec<i32>; 3],
     ac_q: &[Vec<i32>; 3],
     acs: &mut [u8],
+    cost8: &[f32],
     ac32: &mut [Vec<i32>; 3],
     ac32_at: &mut [u32],
     mask: &[f32],
@@ -1755,121 +2019,125 @@ fn try_merge_dct32(
 ) {
     let order = natural_order(32, 32);
     let mat = dct32_matrices();
-    let mat8 = dct8_matrices();
-    let zigzag = dct8_zigzag_ac();
     let qm_scale = [0.8f32, 1.0, 1.0];
     let mul8 = 1.0 - 0.4 / (distance + 1.4);
     const MUL32: f32 = 1.5;
     let (cost_delta, zeros_mul, loss_mul) = entropy_scales(distance);
-    for by in (0..bh.saturating_sub(3)).step_by(4) {
-        for bx in (0..bw.saturating_sub(3)).step_by(4) {
-            let mut ok = true;
-            let mut max_abs = 0i32;
-            for dy in 0..4 {
-                for dx in 0..4 {
-                    let i = (by + dy) * bw + (bx + dx);
-                    if acs[i] != ACS_DCT8 {
-                        ok = false;
-                    }
-                    for &v in &ac_q[1][i * 63..i * 63 + 63] {
-                        max_abs = max_abs.max(v.unsigned_abs() as i32);
-                    }
-                }
-            }
-            if !ok || max_abs > 64 {
-                continue;
-            }
-            let mut cost8 = 0.0f32;
-            for dy in 0..4 {
-                for dx in 0..4 {
-                    let i = (by + dy) * bw + (bx + dx);
-                    cost8 += estimate_8x8(
-                        planes,
-                        pw,
-                        bx + dx,
-                        by + dy,
-                        i,
-                        lf_q,
-                        ac_q,
-                        hf_muls[i],
-                        gs,
-                        mat8,
-                        qm_scale,
-                        &zigzag,
-                        lf_inv,
-                        cost_delta,
-                        zeros_mul,
-                        loss_mul,
-                        mask,
-                        cfl,
-                    );
-                }
-            }
-            cost8 *= mul8;
-            let i00 = by * bw + bx;
-            let mut hf_i = 1i32;
-            for dy in 0..4 {
-                for dx in 0..4 {
-                    hf_i = hf_i.max(hf_muls[(by + dy) * bw + (bx + dx)]);
-                }
-            }
-            let hf = hf_i as f32;
-            let mut coefs = [
-                dct32_fwd_from_plane(planes[0], pw, bx * 8, by * 8),
-                dct32_fwd_from_plane(planes[1], pw, bx * 8, by * 8),
-                dct32_fwd_from_plane(planes[2], pw, bx * 8, by * 8),
-            ];
-            let (kx, kb) = cfl.factors(bx, by);
-            apply_cfl_triple_lf(&mut coefs, kx, kb, 4, 32);
-            let mut hf32 = [vec![0i32; 1008], vec![0i32; 1008], vec![0i32; 1008]];
-            let mut spatial = coefs;
-            for c in 0..3 {
-                let mul = (65536.0 / gs) * qm_scale[c];
-                for (k, &(dx, dy)) in order[16..].iter().enumerate() {
-                    let idx = dx as usize * 32 + dy as usize;
-                    let m = mat[c][idx] * mul;
-                    let t = if m.abs() < 1e-12 {
-                        0.0
-                    } else {
-                        coefs[c][idx] / m * hf
-                    };
-                    hf32[c][k] = quantize_with_bias(t, quant_bias[c], quant_bias_num);
-                    spatial[c][idx] = coefs[c][idx] - hf32[c][k] as f32 * m / hf.max(1e-6);
-                }
-                for y in 0..4 {
-                    for x in 0..4 {
-                        spatial[c][y * 32 + x] = 0.0;
-                    }
-                }
-                idct32_2d(&mut spatial[c]);
-                apply_spatial_mask(&mut spatial[c], mask, pw, bx * 8, by * 8, 32, 32);
-            }
-            let cost32 = hf_cost(&hf32[0], cost_delta, zeros_mul)
-                + hf_cost(&hf32[1], cost_delta, zeros_mul)
-                + hf_cost(&hf32[2], cost_delta, zeros_mul);
-            let mut qf = [0i32; 16];
-            for dy in 0..4 {
-                for dx in 0..4 {
-                    qf[dy * 4 + dx] = hf_muls[(by + dy) * bw + (bx + dx)];
-                }
-            }
-            let loss32 = eighth_loss(
-                [&spatial[0][..], &spatial[1][..], &spatial[2][..]],
-                1024,
-                quant_norm_field(&qf, gs),
-                loss_mul,
-            );
-            if cost32 * MUL32 + loss32 >= cost8 {
-                continue;
-            }
-            let slot = (ac32[0].len() / 1008) as u32;
-            for c in 0..3 {
-                ac32[c].extend_from_slice(&hf32[c]);
-                let dc = dc_from_lowest_32(&coefs[c]);
+    let rows = {
+        let acs: &[u8] = acs;
+        let hf_muls: &[i32] = hf_muls;
+        collect_strided(bh.saturating_sub(3), 4, |by| {
+            let mut wins = Vec::new();
+            for bx in (0..bw.saturating_sub(3)).step_by(4) {
+                let mut ok = true;
+                let mut max_abs = 0i32;
                 for dy in 0..4 {
                     for dx in 0..4 {
-                        lf_q[c][(by + dy) * bw + (bx + dx)] =
-                            (dc[dy * 4 + dx] * lf_inv[c]).round() as i32;
+                        let i = (by + dy) * bw + (bx + dx);
+                        if acs[i] != ACS_DCT8 {
+                            ok = false;
+                        }
+                        for &v in &ac_q[1][i * 63..i * 63 + 63] {
+                            max_abs = max_abs.max(v.unsigned_abs() as i32);
+                        }
+                    }
+                }
+                if !ok || max_abs > 64 {
+                    continue;
+                }
+                let mut cost_sum = 0.0f32;
+                for dy in 0..4 {
+                    for dx in 0..4 {
+                        cost_sum += cost8[(by + dy) * bw + (bx + dx)];
+                    }
+                }
+                cost_sum *= mul8;
+                let i00 = by * bw + bx;
+                let mut hf_i = 1i32;
+                for dy in 0..4 {
+                    for dx in 0..4 {
+                        hf_i = hf_i.max(hf_muls[(by + dy) * bw + (bx + dx)]);
+                    }
+                }
+                let hf = hf_i as f32;
+                let mut coefs = [
+                    dct32_fwd_from_plane(planes[0], pw, bx * 8, by * 8),
+                    dct32_fwd_from_plane(planes[1], pw, bx * 8, by * 8),
+                    dct32_fwd_from_plane(planes[2], pw, bx * 8, by * 8),
+                ];
+                let (kx, kb) = cfl.factors(bx, by);
+                apply_cfl_triple_lf(&mut coefs, kx, kb, 4, 32);
+                let mut hf32 = [[0i32; 1008]; 3];
+                let mut spatial = coefs;
+                for c in 0..3 {
+                    let mul = (65536.0 / gs) * qm_scale[c];
+                    for (k, &(dx, dy)) in order[16..].iter().enumerate() {
+                        let idx = dx as usize * 32 + dy as usize;
+                        let m = mat[c][idx] * mul;
+                        let t = if m.abs() < 1e-12 {
+                            0.0
+                        } else {
+                            coefs[c][idx] / m * hf
+                        };
+                        hf32[c][k] = quantize_with_bias(t, quant_bias[c], quant_bias_num);
+                        spatial[c][idx] = coefs[c][idx] - hf32[c][k] as f32 * m / hf.max(1e-6);
+                    }
+                    for y in 0..4 {
+                        for x in 0..4 {
+                            spatial[c][y * 32 + x] = 0.0;
+                        }
+                    }
+                    idct32_2d(&mut spatial[c]);
+                    apply_spatial_mask(&mut spatial[c], mask, pw, bx * 8, by * 8, 32, 32);
+                }
+                let cost32 = hf_cost(&hf32[0], cost_delta, zeros_mul)
+                    + hf_cost(&hf32[1], cost_delta, zeros_mul)
+                    + hf_cost(&hf32[2], cost_delta, zeros_mul);
+                let mut qf = [0i32; 16];
+                for dy in 0..4 {
+                    for dx in 0..4 {
+                        qf[dy * 4 + dx] = hf_muls[(by + dy) * bw + (bx + dx)];
+                    }
+                }
+                let loss32 = eighth_loss(
+                    [&spatial[0][..], &spatial[1][..], &spatial[2][..]],
+                    1024,
+                    quant_norm_field(&qf, gs),
+                    loss_mul,
+                );
+                if cost32 * MUL32 + loss32 >= cost_sum {
+                    continue;
+                }
+                let mut lf = [[0i32; 16]; 3];
+                for c in 0..3 {
+                    let dc = dc_from_lowest_32(&coefs[c]);
+                    for dy in 0..4 {
+                        for dx in 0..4 {
+                            lf[c][dy * 4 + dx] = (dc[dy * 4 + dx] * lf_inv[c]).round() as i32;
+                        }
+                    }
+                }
+                wins.push(Dct32Pick {
+                    i00,
+                    hf_i,
+                    hf: hf32,
+                    lf,
+                });
+            }
+            wins
+        })
+    };
+    for row in rows {
+        for w in row {
+            let slot = (ac32[0].len() / 1008) as u32;
+            let i00 = w.i00;
+            let by = i00 / bw;
+            let bx = i00 % bw;
+            for c in 0..3 {
+                ac32[c].extend_from_slice(&w.hf[c]);
+                for dy in 0..4 {
+                    for dx in 0..4 {
+                        lf_q[c][(by + dy) * bw + (bx + dx)] = w.lf[c][dy * 4 + dx];
                     }
                 }
             }
@@ -1881,7 +2149,7 @@ fn try_merge_dct32(
                     }
                 }
             }
-            hf_muls[i00] = hf_i;
+            hf_muls[i00] = w.hf_i;
             ac32_at[i00] = slot;
         }
     }
@@ -1985,9 +2253,8 @@ fn estimate_8x8(
     pw: usize,
     bx: usize,
     by: usize,
-    i: usize,
-    lf_q: &[Vec<i32>; 3],
-    ac_q: &[Vec<i32>; 3],
+    lf_blk: [i32; 3],
+    ac_blk: [&[i32]; 3],
     hf_mul: i32,
     gs: f32,
     matrices: &[[f32; 64]; 3],
@@ -2007,25 +2274,28 @@ fn estimate_8x8(
     ];
     let (kx, kb) = cfl.factors(bx, by);
     apply_cfl_triple_lf(&mut orig, kx, kb, 1, 8);
-    let mut qs = Vec::with_capacity(3 * 64);
+    let mut qs = [0i32; 192];
+    let mut nqs = 0usize;
     let mut spatial = orig;
     let hf = (hf_mul as f32).max(1e-6);
     for c in 0..3 {
         // Decoder: rec = q * mat * 65536 / (gs * hf) * qm. Do not fold hf into `m`.
         let mul = (65536.0 / gs) * qm_scale[c];
-        let dc_rec = lf_q[c][i] as f32 / lf_inv[c];
+        let dc_rec = lf_blk[c] as f32 / lf_inv[c];
         spatial[c][0] = orig[c][0] - dc_rec;
-        qs.push(lf_q[c][i]);
+        qs[nqs] = lf_blk[c];
+        nqs += 1;
         for (k, &z) in zigzag.iter().enumerate() {
             let m = matrices[c][z as usize] * mul;
-            let q = ac_q[c][i * 63 + k];
+            let q = ac_blk[c][k];
             spatial[c][z as usize] = orig[c][z as usize] - q as f32 * m / hf;
-            qs.push(q);
+            qs[nqs] = q;
+            nqs += 1;
         }
         idct8_factored_2d(&mut spatial[c]);
         apply_spatial_mask(&mut spatial[c], mask, pw, bx * 8, by * 8, 8, 8);
     }
-    let token = hf_cost(&qs, cost_delta, zeros_mul);
+    let token = hf_cost(&qs[..nqs], cost_delta, zeros_mul);
     token
         + eighth_loss(
             [&spatial[0][..], &spatial[1][..], &spatial[2][..]],
@@ -2033,6 +2303,58 @@ fn estimate_8x8(
             quant_norm_field(&[hf_mul], gs),
             loss_mul,
         )
+}
+
+/// Per-block DCT8 cost used by every later strategy comparison.
+#[allow(clippy::too_many_arguments)]
+fn compute_block_cost8(
+    bw: usize,
+    bh: usize,
+    pw: usize,
+    planes: [&[f32]; 3],
+    lf_q: &[Vec<i32>; 3],
+    ac_q: &[Vec<i32>; 3],
+    hf_muls: &[i32],
+    gs: f32,
+    lf_inv: [f32; 3],
+    distance: f32,
+    mask: &[f32],
+    cfl: &CflMaps,
+) -> Vec<f32> {
+    let mat8 = dct8_matrices();
+    let zigzag = dct8_zigzag_ac();
+    let qm_scale = [0.8f32, 1.0, 1.0];
+    let (cost_delta, zeros_mul, loss_mul) = entropy_scales(distance);
+    let mut costs = vec![0.0f32; bw * bh];
+    par_rows_mut(&mut costs, bw, |by, out| {
+        for bx in 0..bw {
+            let i = by * bw + bx;
+            out[bx] = estimate_8x8(
+                planes,
+                pw,
+                bx,
+                by,
+                [lf_q[0][i], lf_q[1][i], lf_q[2][i]],
+                [
+                    &ac_q[0][i * 63..i * 63 + 63],
+                    &ac_q[1][i * 63..i * 63 + 63],
+                    &ac_q[2][i * 63..i * 63 + 63],
+                ],
+                hf_muls[i],
+                gs,
+                mat8,
+                qm_scale,
+                &zigzag,
+                lf_inv,
+                cost_delta,
+                zeros_mul,
+                loss_mul,
+                mask,
+                cfl,
+            );
+        }
+    });
+    costs
 }
 
 fn transpose4x4(b: &mut [f32; 16]) {
@@ -2146,26 +2468,22 @@ fn try_dct4(
     lf_q: &mut [Vec<i32>; 3],
     ac_q: &mut [Vec<i32>; 3],
     acs: &mut [u8],
+    cost8: &[f32],
     mask: &[f32],
     cfl: &CflMaps,
 ) {
     let mat4 = dct4_matrices();
-    let mat8 = dct8_matrices();
-    let zigzag8 = dct8_zigzag_ac();
     let zigzag4 = dct4_zigzag_ac();
     let qm_scale = [0.8f32, 1.0, 1.0];
     const MUL4: f32 = 1.08 / 0.8;
     let (cost_delta, zeros_mul, loss_mul) = entropy_scales(distance);
-    for by in 0..bh {
+    par_block_rows(bw, bh, lf_q, ac_q, acs, |by, lf_rows, ac_rows, acs_row| {
         for bx in 0..bw {
-            let i = by * bw + bx;
-            if acs[i] != ACS_DCT8 {
+            if acs_row[bx] != ACS_DCT8 {
                 continue;
             }
-            let cost8 = estimate_8x8(
-                planes, pw, bx, by, i, lf_q, ac_q, hf_muls[i], gs, mat8, qm_scale, &zigzag8,
-                lf_inv, cost_delta, zeros_mul, loss_mul, mask, cfl,
-            );
+            let i = by * bw + bx;
+            let cost_8 = cost8[i];
             let hf = hf_muls[i] as f32;
             let (kx, kb) = cfl.factors(bx, by);
             let mut orig = [
@@ -2174,7 +2492,8 @@ fn try_dct4(
                 dct4_8x8_fwd(planes[2], pw, bx * 8, by * 8),
             ];
             apply_cfl_triple_lf(&mut orig, kx, kb, 1, 8);
-            let mut qs = Vec::with_capacity(3 * 64);
+            let mut qs = [0i32; 192];
+            let mut nqs = 0usize;
             let mut spatial = orig;
             let mut ac_store = [[0i32; 63]; 3];
             let mut lf_store = [0i32; 3];
@@ -2183,7 +2502,8 @@ fn try_dct4(
                 lf_store[c] = (orig[c][0] * lf_inv[c]).round() as i32;
                 let dc_rec = lf_store[c] as f32 / lf_inv[c];
                 spatial[c][0] = orig[c][0] - dc_rec;
-                qs.push(lf_store[c]);
+                qs[nqs] = lf_store[c];
+                nqs += 1;
                 for (k, &z) in zigzag4.iter().enumerate() {
                     let m = mat4[c][z as usize] * mul;
                     let t = if m.abs() < 1e-12 {
@@ -2194,12 +2514,13 @@ fn try_dct4(
                     let q = quantize_with_bias(t, quant_bias[c], quant_bias_num);
                     ac_store[c][k] = q;
                     spatial[c][z as usize] = orig[c][z as usize] - q as f32 * m / hf.max(1e-6);
-                    qs.push(q);
+                    qs[nqs] = q;
+                    nqs += 1;
                 }
                 dct4_8x8_inv(&mut spatial[c]);
                 apply_spatial_mask(&mut spatial[c], mask, pw, bx * 8, by * 8, 8, 8);
             }
-            let token = hf_cost(&qs, cost_delta, zeros_mul);
+            let token = hf_cost(&qs[..nqs], cost_delta, zeros_mul);
             let loss = eighth_loss(
                 [&spatial[0][..], &spatial[1][..], &spatial[2][..]],
                 64,
@@ -2207,16 +2528,16 @@ fn try_dct4(
                 loss_mul,
             );
             // C EstimateEntropy: `entropy *= entropy_mul` then `+= loss`.
-            if token * MUL4 + loss >= cost8 {
+            if token * MUL4 + loss >= cost_8 {
                 continue;
             }
-            acs[i] = ACS_DCT4;
+            acs_row[bx] = ACS_DCT4;
             for c in 0..3 {
-                lf_q[c][i] = lf_store[c];
-                ac_q[c][i * 63..i * 63 + 63].copy_from_slice(&ac_store[c]);
+                lf_rows[c][bx] = lf_store[c];
+                ac_rows[c][bx * 63..bx * 63 + 63].copy_from_slice(&ac_store[c]);
             }
         }
-    }
+    });
 }
 
 fn transpose8x8(b: &mut [f32; 64]) {
@@ -2343,29 +2664,24 @@ fn try_dct4x8(
     lf_q: &mut [Vec<i32>; 3],
     ac_q: &mut [Vec<i32>; 3],
     acs: &mut [u8],
+    cost8: &[f32],
     mask: &[f32],
     cfl: &CflMaps,
 ) {
     let mat48 = dct4x8_matrices();
-    let mat8 = dct8_matrices();
-    let zigzag8 = dct8_zigzag_ac();
     let zigzag4 = dct4_zigzag_ac();
     let qm_scale = [0.8f32, 1.0, 1.0];
     const MUL48: f32 = 0.859_316_4 / 0.8;
     let (cost_delta, zeros_mul, loss_mul) = entropy_scales(distance);
-    for by in 0..bh {
+    par_block_rows(bw, bh, lf_q, ac_q, acs, |by, lf_rows, ac_rows, acs_row| {
         for bx in 0..bw {
-            let i = by * bw + bx;
-            if acs[i] != ACS_DCT8 {
+            if acs_row[bx] != ACS_DCT8 {
                 continue;
             }
-            let cost8 = estimate_8x8(
-                planes, pw, bx, by, i, lf_q, ac_q, hf_muls[i], gs, mat8, qm_scale, &zigzag8,
-                lf_inv, cost_delta, zeros_mul, loss_mul, mask, cfl,
-            );
+            let i = by * bw + bx;
             let hf = hf_muls[i] as f32;
             let (kx, kb) = cfl.factors(bx, by);
-            let mut best = cost8;
+            let mut best = cost8[i];
             let mut best_kind = ACS_DCT8;
             let mut best_ac = [[0i32; 63]; 3];
             let mut best_lf = [0i32; 3];
@@ -2383,7 +2699,8 @@ fn try_dct4x8(
                     fwd(planes[2], pw, bx * 8, by * 8),
                 ];
                 apply_cfl_triple_lf(&mut orig, kx, kb, 1, 8);
-                let mut qs = Vec::with_capacity(3 * 64);
+                let mut qs = [0i32; 192];
+                let mut nqs = 0usize;
                 let mut spatial = orig;
                 let mut ac_store = [[0i32; 63]; 3];
                 let mut lf_store = [0i32; 3];
@@ -2392,7 +2709,8 @@ fn try_dct4x8(
                     lf_store[c] = (orig[c][0] * lf_inv[c]).round() as i32;
                     let dc_rec = lf_store[c] as f32 / lf_inv[c];
                     spatial[c][0] = orig[c][0] - dc_rec;
-                    qs.push(lf_store[c]);
+                    qs[nqs] = lf_store[c];
+                    nqs += 1;
                     for (k, &z) in zigzag4.iter().enumerate() {
                         let m = mat48[c][z as usize] * mul;
                         let t = if m.abs() < 1e-12 {
@@ -2403,14 +2721,15 @@ fn try_dct4x8(
                         let q = quantize_with_bias(t, quant_bias[c], quant_bias_num);
                         ac_store[c][k] = q;
                         spatial[c][z as usize] = orig[c][z as usize] - q as f32 * m / hf.max(1e-6);
-                        qs.push(q);
+                        qs[nqs] = q;
+                        nqs += 1;
                     }
                     let mut sp = spatial[c];
                     inv(&mut sp);
                     apply_spatial_mask(&mut sp, mask, pw, bx * 8, by * 8, 8, 8);
                     spatial[c] = sp;
                 }
-                let token = hf_cost(&qs, cost_delta, zeros_mul);
+                let token = hf_cost(&qs[..nqs], cost_delta, zeros_mul);
                 let loss = eighth_loss(
                     [&spatial[0][..], &spatial[1][..], &spatial[2][..]],
                     64,
@@ -2428,13 +2747,13 @@ fn try_dct4x8(
             if best_kind == ACS_DCT8 {
                 continue;
             }
-            acs[i] = best_kind;
+            acs_row[bx] = best_kind;
             for c in 0..3 {
-                lf_q[c][i] = best_lf[c];
-                ac_q[c][i * 63..i * 63 + 63].copy_from_slice(&best_ac[c]);
+                lf_rows[c][bx] = best_lf[c];
+                ac_rows[c][bx * 63..bx * 63 + 63].copy_from_slice(&best_ac[c]);
             }
         }
-    }
+    });
 }
 
 /// libjxl `DCFromLowestFrequencies(DCT16)`: scaled 2×2 IDCT of the LL 2×2.
@@ -2835,6 +3154,47 @@ fn greedy_cluster(freqs: &[Vec<u64>], max_clusters: usize) -> (Vec<Vec<u64>>, Ve
 }
 
 #[cfg(test)]
+mod effort_tests {
+    use super::vardct_tools;
+
+    #[test]
+    fn tools_are_monotonic_and_plateau_at_7() {
+        let steps = [
+            vardct_tools(1),
+            vardct_tools(2),
+            vardct_tools(3),
+            vardct_tools(4),
+            vardct_tools(5),
+            vardct_tools(6),
+            vardct_tools(7),
+        ];
+        for w in steps.windows(2) {
+            let (a, b) = (w[0], w[1]);
+            let added = (a.coeff_order != b.coeff_order) as u8
+                + (a.dct4 != b.dct4) as u8
+                + (a.dct16 != b.dct16) as u8
+                + (a.dct32 != b.dct32) as u8
+                + (a.adaptive_quant != b.adaptive_quant) as u8
+                + (a.gaborish != b.gaborish) as u8
+                + (a.cfl != b.cfl) as u8
+                + (a.block_ctx != b.block_ctx) as u8;
+            assert!(added >= 1, "effort step added no tool: {a:?} -> {b:?}");
+            assert!(b.coeff_order || !a.coeff_order);
+            assert!(b.dct4 || !a.dct4);
+            assert!(b.dct16 || !a.dct16);
+            assert!(b.dct32 || !a.dct32);
+            assert!(b.block_ctx || !a.block_ctx);
+        }
+        let full = vardct_tools(7);
+        assert!(full.coeff_order && full.dct4 && full.dct16 && full.dct32);
+        assert!(full.adaptive_quant && full.gaborish && full.cfl && full.block_ctx);
+        assert_eq!(vardct_tools(7), vardct_tools(8));
+        assert_eq!(vardct_tools(7), vardct_tools(10));
+        assert_eq!(vardct_tools(0), vardct_tools(1));
+    }
+}
+
+#[cfg(test)]
 mod order_tests {
     use super::{
         dct4_8x8_fwd, dct4_8x8_inv, dct4_zigzag_ac, dct4x8_8x8_fwd, dct4x8_8x8_inv, dct8_zigzag_ac,
@@ -3126,18 +3486,30 @@ fn compute_coeff_orders(
         let size = order_size(oid);
         let llf = order_llf(oid);
         let ac_len = size - llf;
-        let mut any = false;
-        for c in 0..3 {
+        // Channels are independent. An identity permutation stays empty,
+        // matching the serial scan (only a non-identity order is written).
+        let ch = map_indexed(3, |c| {
             let slices = collect_order_slices(
-                acs, want, ac_q, ac16, ac16_at, ac32, ac32_at, ac168, ac168_at, c,
+                acs, want, ac_q, ac16, ac16_at, ac32, ac32_at, ac168, ac168_at, c as usize,
             );
             if slices.is_empty() {
-                continue;
+                return (false, Vec::new());
             }
-            any = true;
             let zeros = count_zeros_in_slices(&slices, ac_len);
             let perm = perm_from_zero_counts(&zeros, llf, size);
             if perm.iter().enumerate().any(|(i, &p)| p as usize != i) {
+                (true, perm)
+            } else {
+                (true, Vec::new())
+            }
+        });
+        let mut any = false;
+        for (c, (nonempty, perm)) in ch.into_iter().enumerate() {
+            if !nonempty {
+                continue;
+            }
+            any = true;
+            if !perm.is_empty() {
                 out.perm[oid][c] = perm;
             }
         }
@@ -3154,12 +3526,14 @@ fn compute_coeff_orders(
     out
 }
 
-fn reorder_ac(slice: &[i32], perm: &[u16], llf: usize) -> Vec<i32> {
-    let mut out = vec![0i32; slice.len()];
+/// Permute AC into `scratch` (reused across blocks). `perm` is the full
+/// coefficient order; `llf` leading coefficients are not in `slice`.
+fn reorder_ac_into(slice: &[i32], perm: &[u16], llf: usize, scratch: &mut Vec<i32>) {
+    scratch.clear();
+    scratch.reserve(slice.len());
     for i in 0..slice.len() {
-        out[i] = slice[perm[i + llf] as usize - llf];
+        scratch.push(slice[perm[i + llf] as usize - llf]);
     }
-    out
 }
 
 fn encode_coeff_orders(w: &mut BitWriter, orders: &CoeffOrders) {
@@ -3224,8 +3598,15 @@ fn encode_coeff_orders(w: &mut BitWriter, orders: &CoeffOrders) {
     write_ans_tokens_ex(w, &hists, None, &tokens);
 }
 
+/// HF tokens for one pass group. `ctxs` are raw block-context ids until
+/// [`remap_hf_ctx`] applies the clustered histogram map.
+struct HfGroupTokens {
+    values: Vec<u32>,
+    ctxs: Vec<u8>,
+}
+
 #[allow(clippy::too_many_arguments)]
-fn hist_from_hf_mixed(
+fn hf_pass_tokens(
     width: u32,
     height: u32,
     bw: usize,
@@ -3240,37 +3621,80 @@ fn hist_from_hf_mixed(
     orders: &CoeffOrders,
     hf_muls: &[i32],
     bcm: &BlockCtxModel,
-) -> (Vec<AnsHist>, Vec<u8>, Vec<u8>) {
+) -> Vec<HfGroupTokens> {
+    let num_groups = width.div_ceil(GROUP_DIM) * height.div_ceil(GROUP_DIM);
     let n_raw = bcm.n_clusters as usize * 3;
     let identity: Vec<u8> = (0..n_raw as u8).collect();
-    let mut freqs = vec![vec![0u64; 32]; n_raw];
-    let num_groups = width.div_ceil(GROUP_DIM) * height.div_ceil(GROUP_DIM);
-    for g in 0..num_groups {
-        let (vals, ctxs) = hf_group_stream(
+    map_indexed(num_groups, |g| {
+        let (values, ctxs) = hf_group_stream(
             width, height, bw, g, ac_q, acs, ac16, ac16_at, ac32, ac32_at, ac168, ac168_at,
             &identity, orders, hf_muls, bcm,
         );
-        super::entropy::for_each_token_ctx_len(
-            &vals,
-            &ctxs,
-            false,
-            LZ77_MIN_LENGTH,
-            |cluster, token, _, _| {
-                let i = cluster as usize;
-                if i < freqs.len() {
-                    let t = token as usize;
-                    if t >= freqs[i].len() {
-                        freqs[i].resize(t + 1, 0);
-                    }
-                    freqs[i][t] += 1;
+        HfGroupTokens { values, ctxs }
+    })
+}
+
+fn hf_token_freqs(tok: &HfGroupTokens, n_raw: usize) -> Vec<Vec<u64>> {
+    let mut freqs = vec![vec![0u64; 32]; n_raw];
+    super::entropy::for_each_token_ctx_len(
+        &tok.values,
+        &tok.ctxs,
+        false,
+        LZ77_MIN_LENGTH,
+        |cluster, token, _, _| {
+            let i = cluster as usize;
+            if i < freqs.len() {
+                let t = token as usize;
+                if t >= freqs[i].len() {
+                    freqs[i].resize(t + 1, 0);
                 }
-            },
-        );
+                freqs[i][t] += 1;
+            }
+        },
+    );
+    freqs
+}
+
+fn hist_from_hf_tokens(
+    tokens: &[HfGroupTokens],
+    bcm: &BlockCtxModel,
+) -> (Vec<AnsHist>, Vec<u8>, Vec<u8>) {
+    let n_raw = bcm.n_clusters as usize * 3;
+    let parts = map_slice(tokens, |tok| hf_token_freqs(tok, n_raw));
+    let mut freqs = vec![vec![0u64; 32]; n_raw];
+    for part in parts {
+        for (dst, src) in freqs.iter_mut().zip(part) {
+            if src.len() > dst.len() {
+                dst.resize(src.len(), 0);
+            }
+            for (d, s) in dst.iter_mut().zip(&src) {
+                *d += *s;
+            }
+        }
     }
     let (merged, assign) = greedy_cluster(&freqs, 8);
     let map = hf_cluster_map(&assign, bcm.n_clusters as usize);
     let hists = merged.into_iter().map(finish_ans).collect();
     (hists, map, assign)
+}
+
+/// Replace raw context ids with the clustered assignment. Same bytes as
+/// building the stream a second time with `assign` instead of identity.
+fn remap_hf_ctx(tokens: &mut [HfGroupTokens], assign: &[u8]) {
+    let apply = |tok: &mut HfGroupTokens| {
+        for c in &mut tok.ctxs {
+            *c = assign[*c as usize];
+        }
+    };
+    #[cfg(feature = "parallel")]
+    {
+        use rayon::prelude::*;
+        tokens.par_iter_mut().for_each(apply);
+    }
+    #[cfg(not(feature = "parallel"))]
+    {
+        tokens.iter_mut().for_each(apply);
+    }
 }
 
 fn code_from_values(vals: &[u32]) -> PrefixCode {
@@ -3478,35 +3902,17 @@ fn encode_hf_global(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn encode_pass_group_vardct(
+fn encode_pass_tokens(
     w: &mut BitWriter,
-    width: u32,
-    height: u32,
-    bw: usize,
-    g: u32,
-    ac_q: &[Vec<i32>; 3],
-    acs: &[u8],
-    ac16: &[Vec<i32>; 3],
-    ac16_at: &[u32],
-    ac32: &[Vec<i32>; 3],
-    ac32_at: &[u32],
-    ac168: &[Vec<i32>; 3],
-    ac168_at: &[u32],
+    values: &[u32],
+    ctxs: &[u8],
     hists: &[AnsHist],
-    assign: &[u8],
-    orders: &CoeffOrders,
     dist: Option<&AnsHist>,
-    hf_muls: &[i32],
-    bcm: &BlockCtxModel,
 ) {
-    let (vals, ctxs) = hf_group_stream(
-        width, height, bw, g, ac_q, acs, ac16, ac16_at, ac32, ac32_at, ac168, ac168_at, assign,
-        orders, hf_muls, bcm,
-    );
-    let mut tokens = Vec::with_capacity(vals.len() + 8);
+    let mut tokens = Vec::with_capacity(values.len() + 8);
     collect_ans_tokens_ctx_len_dist(
-        &vals,
-        &ctxs,
+        values,
+        ctxs,
         dist.is_some(),
         dist.map(|_| HF_LZ77_DIST_CLUSTER),
         LZ77_MIN_LENGTH,
@@ -3545,19 +3951,21 @@ fn hf_group_stream(
     let gh = (bh - y0).min((GROUP_DIM / 8) as usize);
     let mut values = Vec::with_capacity(gw * gh * 48);
     let mut ctxs = Vec::with_capacity(gw * gh * 48);
-    let push = |values: &mut Vec<u32>,
-                ctxs: &mut Vec<u8>,
-                acs_id: u8,
-                oid: usize,
-                c: usize,
-                slice: &[i32],
-                hf_mul: i32| {
+    // DCT32 AC is 1008 coefficients. One buffer covers every block in the group.
+    let mut scratch: Vec<i32> = Vec::with_capacity(1008);
+    let mut push = |values: &mut Vec<u32>,
+                    ctxs: &mut Vec<u8>,
+                    acs_id: u8,
+                    oid: usize,
+                    c: usize,
+                    slice: &[i32],
+                    hf_mul: i32| {
         let perm = &orders.perm[oid][c];
         if perm.is_empty() {
             hf_push_slice(values, ctxs, acs_id, c, slice, assign, hf_mul, bcm);
         } else {
-            let re = reorder_ac(slice, perm, order_llf(oid));
-            hf_push_slice(values, ctxs, acs_id, c, &re, assign, hf_mul, bcm);
+            reorder_ac_into(slice, perm, order_llf(oid), &mut scratch);
+            hf_push_slice(values, ctxs, acs_id, c, &scratch, assign, hf_mul, bcm);
         }
     };
     for by in y0..y0 + gh {

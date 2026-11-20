@@ -491,7 +491,7 @@ pub fn hybrid_uint_400(value: u32) -> (u32, u32, u32) {
 }
 
 pub const LZ77_MIN_SYMBOL: u32 = 224;
-pub const LZ77_MIN_LENGTH: u32 = 7;
+pub const LZ77_MIN_LENGTH: u32 = 128;
 
 /// All `num_dist` contexts share one prefix histogram (simple clustering → 0).
 #[allow(dead_code)]
@@ -1489,15 +1489,15 @@ fn build_stream_tree(
 ///
 /// Index `(!|W|>0)*2 + (!|N|>0)`. Unsplit fills every slot with the same ctx.
 #[allow(dead_code)]
-pub fn ma_bfs_leaf_ctxs(leaves: &[MaLeaf]) -> Vec<[u8; 8]> {
+pub fn ma_bfs_leaf_ctxs(leaves: &[MaLeaf]) -> Vec<[u32; 8]> {
     ma_bfs_leaf_ctxs_hf(leaves, None)
 }
 
-pub fn ma_bfs_leaf_ctxs_hf(leaves: &[MaLeaf], hf: Option<&ResTree>) -> Vec<[u8; 8]> {
-    let mut out = vec![[0u8; 8]; leaves.len()];
+pub fn ma_bfs_leaf_ctxs_hf(leaves: &[MaLeaf], hf: Option<&ResTree>) -> Vec<[u32; 8]> {
+    let mut out = vec![[0u32; 8]; leaves.len()];
     let mut q = std::collections::VecDeque::new();
     q.push_back(build_spine(leaves, 0, hf));
-    let mut ctx = 0u8;
+    let mut ctx = 0u32;
     while let Some(n) = q.pop_front() {
         match n {
             EncMa::D { l, r, .. } => {
@@ -1543,16 +1543,16 @@ pub fn ma_stream_ctxs(
     pass: &[MaLeaf],
     stream_cut: u32,
     hf: Option<&ResTree>,
-) -> [Vec<[u8; 8]>; 3] {
+) -> [Vec<[u32; 8]>; 3] {
     let mut maps = [
-        vec![[0u8; 8]; gmod.len()],
-        vec![[0u8; 8]; lf.len()],
-        vec![[0u8; 8]; pass.len()],
+        vec![[0u32; 8]; gmod.len()],
+        vec![[0u32; 8]; lf.len()],
+        vec![[0u32; 8]; pass.len()],
     ];
     let chains = [gmod, lf, pass];
     let mut q = std::collections::VecDeque::new();
     q.push_back(build_stream_tree(gmod, lf, pass, stream_cut, hf));
-    let mut ctx = 0u8;
+    let mut ctx = 0u32;
     while let Some(n) = q.pop_front() {
         match n {
             EncMa::D { l, r, .. } => {

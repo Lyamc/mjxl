@@ -115,8 +115,8 @@ cargo run --release -- decode samples/jxl/anim-icos.jxl --all-frames
 | EXR out | no | yes |
 | Modular lossless encode | yes | yes |
 | Modular lossy (`-q` / `-d`) | yes (quantized residuals) | yes (richer) |
-| VarDCT lossy encode (`-m 0`) | yes (8×8, Gabor/EPF off) | yes (varblocks, Gabor/EPF) |
-| Effort 1–10 / `-p` groups | yes | yes |
+| VarDCT lossy encode (`-m 0`) | yes (8×8 through 32×32; Gaborish from effort 5) | yes (varblocks, Gabor/EPF) |
+| Effort 1–10 / `-p` groups | yes (default 2; 7..=10 are the full path) | yes |
 | Squeeze (`-R` / `--responsive`) | yes (default params) | yes |
 | Palette (`--modular-palette-colors`) | yes (lossless) | yes (lossy too) |
 | 16-bit integer encode | yes | yes |
@@ -137,6 +137,7 @@ djxl samples/jxl/dice.jxl dice-djxl.png
 use o3_jxl::{Decoder, Encoder, PixelFormat, write_png};
 
 let lossless = Encoder::new().encode_rgb8(width, height, &rgb)?;
+// `.effort()` defaults to 2. 7 is the full VarDCT path (8..=10 match it).
 let q90 = Encoder::new().quality(90.0).effort(7).encode_rgb8(width, height, &rgb)?;
 let modular_lossy = Encoder::new().distance(1.0).modular(Some(true)).encode_rgb8(width, height, &rgb)?;
 let squeezed = Encoder::new().responsive(Some(true)).encode_rgb8(width, height, &rgb)?;

@@ -7,6 +7,7 @@
 use std::simd::prelude::*;
 
 type I32x4 = Simd<i32, 4>;
+type I32x8 = Simd<i32, 8>;
 
 /// One Squeeze step as in `SqueezeParams`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -208,7 +209,28 @@ fn fwd_v(ch: &mut EncChannel) -> EncChannel {
             let a_off = y * 2 * w;
             let b_off = a_off + w;
             let avg_off = y * w;
-            for x in 0..w {
+            let mut x = 0;
+            while x + 8 <= w {
+                let avg_s = I32x8::from_slice(&avg[avg_off + x..]);
+                let next_avg = if y + 1 < res_h {
+                    I32x8::from_slice(&avg[(y + 1) * w + x..])
+                } else if h % 2 == 1 {
+                    I32x8::from_slice(&ch.samples[(h - 1) * w + x..])
+                } else {
+                    avg_s
+                };
+                let left = if y > 0 {
+                    I32x8::from_slice(&ch.samples[(y * 2 - 1) * w + x..])
+                } else {
+                    avg_s
+                };
+                let t = tendency_i32x8(left, avg_s, next_avg);
+                let a = I32x8::from_slice(&ch.samples[a_off + x..]);
+                let b = I32x8::from_slice(&ch.samples[b_off + x..]);
+                (a - b - t).copy_to_slice(&mut res[avg_off + x..]);
+                x += 8;
+            }
+            for x in x..w {
                 let left = if y > 0 {
                     ch.samples[(y * 2 - 1) * w + x]
                 } else {
@@ -273,13 +295,37 @@ fn squeeze_row_h(src: &[i32], dst_avg: &mut [i32], dst_res: &mut [i32], src_len:
         dst_avg[avg_w - 1] = src[src_len - 1];
     }
 
-    for x in 0..res_w {
+    let odd_len = src_len % 2 == 1;
+    let mut x = 0;
+    while x + 8 <= res_w {
+        let even = I32x8::from_array(core::array::from_fn(|i| src[(x + i) * 2]));
+        let odd = I32x8::from_array(core::array::from_fn(|i| src[(x + i) * 2 + 1]));
+        let avg = I32x8::from_slice(&dst_avg[x..]);
+        let next_avg = I32x8::from_array(core::array::from_fn(|i| {
+            let j = x + i;
+            if j + 1 < res_w {
+                dst_avg[j + 1]
+            } else if odd_len {
+                src[j * 2 + 2]
+            } else {
+                dst_avg[j]
+            }
+        }));
+        let left = I32x8::from_array(core::array::from_fn(|i| {
+            let j = x + i;
+            if j > 0 { src[j * 2 - 1] } else { dst_avg[j] }
+        }));
+        let t = tendency_i32x8(left, avg, next_avg);
+        (even - odd - t).copy_to_slice(&mut dst_res[x..]);
+        x += 8;
+    }
+    for x in x..res_w {
         let a = src[x * 2];
         let b = src[x * 2 + 1];
         let avg = dst_avg[x];
         let next_avg = if x + 1 < res_w {
             dst_avg[x + 1]
-        } else if src_len % 2 == 1 {
+        } else if odd_len {
             src[x * 2 + 2]
         } else {
             avg
@@ -325,6 +371,31 @@ pub fn tendency_i32(a: i32, b: i32, c: i32) -> i32 {
     } else {
         0
     }
+}
+
+/// Lane-wise `tendency_i32`. Truncating division by 12 matches the scalar
+/// path; LLVM lowers it to a multiply-high sequence.
+#[inline]
+fn tendency_i32x8(a: I32x8, b: I32x8, c: I32x8) -> I32x8 {
+    let one = I32x8::splat(1);
+    let six = I32x8::splat(6);
+    let twelve = I32x8::splat(12);
+    let two_ab = (a - b) << 1;
+    let two_bc = (b - c) << 1;
+
+    // a >= b >= c
+    let xi = (a * I32x8::splat(4) - c * I32x8::splat(3) - b + six) / twelve;
+    let xi = (xi - (xi & one)).simd_gt(two_ab).select(two_ab + one, xi);
+    let xi = (xi + (xi & one)).simd_gt(two_bc).select(two_bc, xi);
+
+    // a <= b <= c
+    let xd = (a * I32x8::splat(4) - c * I32x8::splat(3) - b - six) / twelve;
+    let xd = (xd + (xd & one)).simd_lt(two_ab).select(two_ab - one, xd);
+    let xd = (xd - (xd & one)).simd_lt(two_bc).select(two_bc, xd);
+
+    let inc = a.simd_ge(b) & b.simd_ge(c);
+    let dec = a.simd_le(b) & b.simd_le(c);
+    inc.select(xi, dec.select(xd, I32x8::splat(0)))
 }
 
 /// Inverse horizontal squeeze (for tests). `out_w = avg_w + res_w`.

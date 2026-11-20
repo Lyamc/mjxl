@@ -24,7 +24,13 @@ pub fn decode_jxl_rgb(bytes: &[u8]) -> Result<(u32, u32, Vec<u8>)> {
         .into_iter()
         .next()
         .ok_or_else(|| Error::from("empty jxl sample"))?;
-    Ok((fr.width, fr.height, rgba_to_rgb(&fr.rgba)))
+    let t = std::time::Instant::now();
+    let rgb = rgba_to_rgb(&fr.rgba);
+    if std::env::var_os("O3_PROFILE").is_some() {
+        let ms = t.elapsed().as_secs_f64() * 1000.0;
+        eprintln!("profile {:16} {:8.1} ms", "rgba-to-rgb", ms);
+    }
+    Ok((fr.width, fr.height, rgb))
 }
 
 /// `fraction` is in `0.0..=1.0` of `bytes`. `Ok(None)` means the prefix cannot

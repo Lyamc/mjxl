@@ -315,28 +315,74 @@ pub fn encode_sequence(
     frames: &[Vec<u8>],
     opts: &SequenceOpts,
 ) -> Result<Vec<Coded>> {
+    // Intra frames do not depend on each other. A 960×540 frame does not fill
+    // a 32-thread machine, so encoding the clip together beats per-frame pools.
+    if opts.intra {
+        return encode_intra(enc, width, height, frames);
+    }
     let gpu = gpu::select(opts.backend)?;
+    // A clip that dirties every frame produces exactly the intra bitstream.
+    // Analyse up front so those frames can share the parallel intra path
+    // instead of being encoded one at a time behind the dirty search.
+    let decisions: Option<Vec<Dirty>> = if !opts.closed_loop && frames.len() > 1 {
+        use rayon::prelude::*;
+        let mut v = Vec::with_capacity(frames.len());
+        v.push(Dirty::Full);
+        // Independent frame pairs: CPU tile masks run in parallel. This is
+        // only a planning pass; the result is reused by the serial path.
+        v.extend(
+            frames
+                .par_windows(2)
+                .map(|pair| analyze(&pair[0], &pair[1], width, height))
+                .collect::<Vec<_>>(),
+        );
+        Some(v)
+    } else {
+        None
+    };
+    if decisions
+        .as_ref()
+        .is_some_and(|v| v.iter().all(|d| matches!(d, Dirty::Full)))
+    {
+        return encode_intra(enc, width, height, frames);
+    }
     let mut out = Vec::with_capacity(frames.len());
     let mut prev: Option<Vec<u8>> = None;
-    for rgb in frames {
+    for (i, rgb) in frames.iter().enumerate() {
         let coded = if opts.intra || prev.is_none() {
             encode_full(enc, width, height, rgb)?
         } else {
             let prev_rgb = prev.as_deref().unwrap();
-            match analyze_with(gpu.as_deref(), opts.backend, prev_rgb, rgb, width, height)? {
+            let dirty = if let Some(ref v) = decisions {
+                v[i].clone()
+            } else {
+                analyze_with(gpu.as_deref(), opts.backend, prev_rgb, rgb, width, height)?
+            };
+            match dirty {
                 Dirty::Skip => Coded::skip(1, width, height),
                 Dirty::Full => encode_full(enc, width, height, rgb)?,
                 Dirty::Rects(rects) => encode_rects(enc, width, rgb, &rects)?,
             }
         };
-        prev = Some(if opts.closed_loop {
-            reconstruct(width, height, prev.as_deref(), &coded)?
-        } else {
-            rgb.clone()
-        });
+        // Intra never reads `prev`. Skip the full-frame clone on that path.
+        if !opts.intra {
+            prev = Some(if opts.closed_loop {
+                reconstruct(width, height, prev.as_deref(), &coded)?
+            } else {
+                rgb.clone()
+            });
+        }
         out.push(coded);
     }
     Ok(out)
+}
+
+fn encode_intra(enc: &Encoder, width: u32, height: u32, frames: &[Vec<u8>]) -> Result<Vec<Coded>> {
+    use rayon::prelude::*;
+    frames
+        .par_iter()
+        .map(|rgb| encode_full(enc, width, height, rgb))
+        .collect()
 }
 
 fn encode_full(enc: &Encoder, width: u32, height: u32, rgb: &[u8]) -> Result<Coded> {

@@ -219,6 +219,148 @@ pub fn gaborish_inverse_plane(src: &[f32], width: usize, height: usize, mul: f32
     dst
 }
 
+fn mirror_idx(i: i32, n: usize) -> usize {
+    if n <= 1 {
+        return 0;
+    }
+    let n = n as i32;
+    let period = 2 * (n - 1);
+    let mut x = i % period;
+    if x < 0 {
+        x += period;
+    }
+    if x >= n {
+        (period - x) as usize
+    } else {
+        x as usize
+    }
+}
+
+fn gaborish_inverse_pixel(
+    src: &[f32],
+    width: usize,
+    height: usize,
+    x: usize,
+    y: usize,
+    c: f32,
+    r: f32,
+    d: f32,
+    big_r: f32,
+    ell: f32,
+    big_d: f32,
+) -> f32 {
+    let sample = |dx: i32, dy: i32| {
+        src[mirror_idx(y as i32 + dy, height) * width + mirror_idx(x as i32 + dx, width)]
+    };
+    c * sample(0, 0)
+        + r * (sample(-1, 0) + sample(1, 0) + sample(0, -1) + sample(0, 1))
+        + d * (sample(-1, -1) + sample(1, -1) + sample(-1, 1) + sample(1, 1))
+        + big_r * (sample(-2, 0) + sample(2, 0) + sample(0, -2) + sample(0, 2))
+        + ell
+            * (sample(-2, -1)
+                + sample(-1, -2)
+                + sample(1, -2)
+                + sample(2, -1)
+                + sample(2, 1)
+                + sample(1, 2)
+                + sample(-1, 2)
+                + sample(-2, 1))
+        + big_d * (sample(-2, -2) + sample(2, -2) + sample(-2, 2) + sample(2, 2))
+}
+
+/// Interior of one row. `ym*` / `out` are exactly `width` samples (one row).
+/// Returns the first x the 8-wide loop did not write. x = 0, 1 and the tail
+/// need the mirrored border, so the caller fills those in scalar.
+fn gaborish_inverse_row_simd(
+    ym2: &[f32],
+    ym1: &[f32],
+    y0: &[f32],
+    yp1: &[f32],
+    yp2: &[f32],
+    out: &mut [f32],
+    c: f32,
+    r: f32,
+    d: f32,
+    big_r: f32,
+    ell: f32,
+    big_d: f32,
+) -> usize {
+    let width = out.len();
+    let cv = F32x8::splat(c);
+    let rv = F32x8::splat(r);
+    let dv = F32x8::splat(d);
+    let brv = F32x8::splat(big_r);
+    let lv = F32x8::splat(ell);
+    let bdv = F32x8::splat(big_d);
+    let mut x = 2usize;
+    // x+9 is the last sample read (offset +2, plus 7 lanes). Stay inside the row.
+    while x + 10 <= width {
+        let at = |row: &[f32], ox: isize| F32x8::from_slice(&row[(x as isize + ox) as usize..]);
+        let acc = at(y0, 0) * cv
+            + (at(y0, -1) + at(y0, 1) + at(ym1, 0) + at(yp1, 0)) * rv
+            + (at(ym1, -1) + at(ym1, 1) + at(yp1, -1) + at(yp1, 1)) * dv
+            + (at(y0, -2) + at(y0, 2) + at(ym2, 0) + at(yp2, 0)) * brv
+            + (at(ym1, -2)
+                + at(ym2, -1)
+                + at(ym2, 1)
+                + at(ym1, 2)
+                + at(yp1, 2)
+                + at(yp2, 1)
+                + at(yp2, -1)
+                + at(yp1, -2))
+                * lv
+            + (at(ym2, -2) + at(ym2, 2) + at(yp2, -2) + at(yp2, 2)) * bdv;
+        acc.copy_to_slice(&mut out[x..]);
+        x += 8;
+    }
+    x
+}
+
+fn gaborish_inverse_fill_row(
+    src: &[f32],
+    out: &mut [f32],
+    width: usize,
+    height: usize,
+    y: usize,
+    c: f32,
+    r: f32,
+    d: f32,
+    big_r: f32,
+    ell: f32,
+    big_d: f32,
+) {
+    let one = |x: usize, out: &mut [f32]| {
+        out[x] = gaborish_inverse_pixel(src, width, height, x, y, c, r, d, big_r, ell, big_d);
+    };
+    // Vertical neighbors of the top and bottom two rows are mirrored.
+    if width < 12 || y < 2 || y + 2 >= height {
+        for x in 0..width {
+            one(x, out);
+        }
+        return;
+    }
+    one(0, out);
+    one(1, out);
+    let y0 = y * width;
+    let tail = gaborish_inverse_row_simd(
+        &src[y0 - 2 * width..y0 - width],
+        &src[y0 - width..y0],
+        &src[y0..y0 + width],
+        &src[y0 + width..y0 + 2 * width],
+        &src[y0 + 2 * width..y0 + 3 * width],
+        out,
+        c,
+        r,
+        d,
+        big_r,
+        ell,
+        big_d,
+    );
+    for x in tail..width {
+        one(x, out);
+    }
+}
+
 pub fn gaborish_inverse_plane_into(
     src: &[f32],
     dst: &mut [f32],
@@ -228,6 +370,9 @@ pub fn gaborish_inverse_plane_into(
 ) {
     assert_eq!(src.len(), width * height);
     assert_eq!(dst.len(), width * height);
+    if width == 0 || height == 0 {
+        return;
+    }
     let sum = 1.0
         + mul
             * 4.0
@@ -246,44 +391,16 @@ pub fn gaborish_inverse_plane_into(
     let ell = nm * GABORISH_INV[3];
     let big_d = nm * GABORISH_INV[4];
 
-    let mirror = |i: i32, n: usize| -> usize {
-        if n <= 1 {
-            return 0;
-        }
-        let n = n as i32;
-        let period = 2 * (n - 1);
-        let mut x = i % period;
-        if x < 0 {
-            x += period;
-        }
-        if x >= n {
-            (period - x) as usize
-        } else {
-            x as usize
-        }
-    };
-
-    for y in 0..height {
-        let yw = y * width;
-        for x in 0..width {
-            let sample = |dx: i32, dy: i32| {
-                src[mirror(y as i32 + dy, height) * width + mirror(x as i32 + dx, width)]
-            };
-            dst[yw + x] = c * sample(0, 0)
-                + r * (sample(-1, 0) + sample(1, 0) + sample(0, -1) + sample(0, 1))
-                + d * (sample(-1, -1) + sample(1, -1) + sample(-1, 1) + sample(1, 1))
-                + big_r * (sample(-2, 0) + sample(2, 0) + sample(0, -2) + sample(0, 2))
-                + ell
-                    * (sample(-2, -1)
-                        + sample(-1, -2)
-                        + sample(1, -2)
-                        + sample(2, -1)
-                        + sample(2, 1)
-                        + sample(1, 2)
-                        + sample(-1, 2)
-                        + sample(-2, 1))
-                + big_d * (sample(-2, -2) + sample(2, -2) + sample(-2, 2) + sample(2, 2));
-        }
+    #[cfg(feature = "parallel")]
+    if height >= 32 && width >= 64 {
+        use rayon::prelude::*;
+        dst.par_chunks_mut(width).enumerate().for_each(|(y, row)| {
+            gaborish_inverse_fill_row(src, row, width, height, y, c, r, d, big_r, ell, big_d);
+        });
+        return;
+    }
+    for (y, row) in dst.chunks_mut(width).enumerate() {
+        gaborish_inverse_fill_row(src, row, width, height, y, c, r, d, big_r, ell, big_d);
     }
 }
 
@@ -368,6 +485,41 @@ mod tests {
         let out = gaborish_inverse_plane(&src, 16, 12, GABORISH_INV_MUL_VARDCT[1]);
         for v in &out {
             assert!((v - 0.4).abs() < 1e-5, "{v}");
+        }
+    }
+
+    #[test]
+    fn gaborish_inverse_simd_matches_scalar_pixel() {
+        let width = 40;
+        let height = 18;
+        let src: Vec<f32> = (0..width * height)
+            .map(|i| ((i * 17) % 64) as f32 * 0.01 - 0.2)
+            .collect();
+        let out = gaborish_inverse_plane(&src, width, height, GABORISH_INV_MUL_VARDCT[0]);
+        let mul = GABORISH_INV_MUL_VARDCT[0];
+        let sum = 1.0
+            + mul
+                * 4.0
+                * (GABORISH_INV[0]
+                    + GABORISH_INV[1]
+                    + GABORISH_INV[2]
+                    + GABORISH_INV[4]
+                    + 2.0 * GABORISH_INV[3]);
+        let n = sum.recip();
+        let nm = mul * n;
+        let c = n;
+        let r = nm * GABORISH_INV[0];
+        let d = nm * GABORISH_INV[1];
+        let big_r = nm * GABORISH_INV[2];
+        let ell = nm * GABORISH_INV[3];
+        let big_d = nm * GABORISH_INV[4];
+        for y in 0..height {
+            for x in 0..width {
+                let expect =
+                    gaborish_inverse_pixel(&src, width, height, x, y, c, r, d, big_r, ell, big_d);
+                let got = out[y * width + x];
+                assert!((got - expect).abs() < 1e-5, "({x},{y}) {got} vs {expect}");
+            }
         }
     }
 

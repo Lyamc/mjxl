@@ -4,7 +4,19 @@ use super::bits::{
     BitWriter, U32, off, u, write_dim, write_enum, write_toc_size, write_u32, write_u64,
 };
 
-#[derive(Clone, Copy, Debug)]
+/// A single patch copying a rectangle from a saved reference frame.
+#[derive(Clone, Debug, Default)]
+pub struct PatchSpec {
+    pub ref_idx: u32,
+    pub x0: u32,
+    pub y0: u32,
+    pub width: u32,
+    pub height: u32,
+    pub x: i32,
+    pub y: i32,
+}
+
+#[derive(Clone, Debug)]
 pub struct ImageParams {
     pub width: u32,
     pub height: u32,
@@ -20,6 +32,10 @@ pub struct ImageParams {
     pub gab: bool,
     /// EPF iterations 0..=3. cjxl: count of distance thresholds `{0.7, 1.5, 4.0}`.
     pub epf_iters: u8,
+    /// Reference slot to save this frame into (0 = none).
+    pub save_as_reference: u8,
+    /// Patch to apply on top of this frame's modular data.
+    pub patches: Option<PatchSpec>,
 }
 
 /// Image-level animation header (`tps = num/den`, `0` loops = forever).
@@ -167,11 +183,13 @@ pub fn write_frame_header(w: &mut BitWriter, p: ImageParams) {
     w.put_bool(false); // all_default
     w.put(2, 0); // regular frame
     w.put_bool(!p.vardct); // 0 = VarDCT, 1 = modular
-    if p.vardct {
-        write_u64(w, 0x80); // skip adaptive LF smoothing
-    } else {
-        write_u64(w, 0);
+    // FrameFlags: 0x80 = skip adaptive LF smoothing (VarDCT),
+    // 0x02 = patches present.
+    let mut flags = if p.vardct { 0x80u64 } else { 0 };
+    if p.patches.is_some() {
+        flags |= 0x02;
     }
+    write_u64(w, flags);
     if !p.xyb_encoded {
         w.put_bool(false); // not YCbCr
     }
@@ -211,7 +229,13 @@ pub fn write_frame_header(w: &mut BitWriter, p: ImageParams) {
     }
     w.put_bool(p.is_last);
     if !p.is_last {
-        w.put(2, 0); // save_as_reference
+        w.put(2, u64::from(p.save_as_reference));
+        // save_before_ct is present when a reset-canvas frame is saved as a
+        // reference. Save after the colour transform so patches copy the
+        // same grid representation the decoder composites in.
+        if p.save_as_reference != 0 {
+            w.put_bool(true);
+        }
     }
     write_u32(w, 0, U32::Const(0), u(4), off(16, 5), off(48, 10)); // empty name
     write_restoration_filter(w, p);

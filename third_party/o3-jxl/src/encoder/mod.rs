@@ -21,7 +21,7 @@ use entropy::{
     ma_bfs_leaf_ctxs_hf, ma_stream_ctxs, ma_stream_leaf_count, write_ma_tree,
 };
 use header::{
-    AnimHeader, ImageParams, ModularTransform, write_frame_header, write_image_header,
+    AnimHeader, ImageParams, ModularTransform, PatchSpec, write_frame_header, write_image_header,
     write_local_modular_prefix, write_modular_header, write_toc,
 };
 use palette::try_palette;
@@ -31,6 +31,19 @@ use predict::{
 use squeeze::{EncChannel, apply_squeeze, default_squeeze_params};
 
 use crate::simd::srgb8_rgb_to_xyb_padded;
+
+/// Optional phase timing, enabled by setting `MJXL_PROFILE=1`.
+#[inline]
+pub(crate) fn profile(label: &str, start: std::time::Instant) {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ENABLED.get_or_init(|| std::env::var_os("MJXL_PROFILE").is_some()) {
+        let tid = std::thread::current().id();
+        eprintln!(
+            "PROF {label} {:>9.3} ms  {tid:?}",
+            start.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+}
 
 /// Pixel layout of the 8-bit input buffer (packed, row-major).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -51,6 +64,12 @@ impl PixelFormat {
         }
     }
 }
+
+/// Default effort. 2 is coefficient orders only: on `bike.png` and `kodim23.png`
+/// at distance 1 that is about 1% smaller than effort 1, at the same RGB PSNR,
+/// for a few milliseconds. Effort 3's 4×4 search saves much less per millisecond.
+/// 7..=10 are the full VarDCT path.
+pub const DEFAULT_EFFORT: u8 = 2;
 
 /// JPEG XL encoder: **modular** (lossless and lossy residuals) and **VarDCT**.
 ///
@@ -89,7 +108,7 @@ impl Encoder {
     pub fn new() -> Self {
         Self {
             distance: 0.0,
-            effort: 7,
+            effort: DEFAULT_EFFORT,
             progressive: false,
             responsive: None,
             palette_colors: 256,
@@ -115,7 +134,14 @@ impl Encoder {
         self.distance(quality_to_distance(q))
     }
 
-    /// Encoder effort 1..=10 (cjxl range). Higher = more groups / LZ77.
+    /// Encoder effort 1..=10, same scale as `cjxl -e` (1 is the fastest).
+    ///
+    /// VarDCT adds, in order: coefficient orders (2), 4×4 / 4×8 search (3),
+    /// 16×16 and rectangular DCTs (4), Gaborish with the adaptive quant field
+    /// and chroma-from-luma (5), the block-context model (6), then 32×32 (7).
+    /// Effort 7..=10 are that full path. Lossy modular keeps libjxl's automatic
+    /// group size at effort ≥ 5 and uses larger groups below that. Lossless
+    /// modular also turns on LZ77 at 3, palette search at 5, and Squeeze at 8.
     pub fn effort(mut self, e: u8) -> Self {
         self.effort = e.clamp(1, 10);
         self
@@ -180,7 +206,7 @@ impl Encoder {
             group_size_shift: shift,
             // Lossy pass groups + LZ77 can emit a repeat as the first symbol
             // of a context (UnexpectedLz77Repeat). Keep RLE for lossless.
-            lz77: self.effort >= 3 && self.distance <= 0.0,
+            lz77: self.effort >= 3 || self.distance > 0.0,
             lz77_min_len: LZ77_MIN_LENGTH,
             quant,
             mul_log,
@@ -226,6 +252,7 @@ impl Encoder {
             return vardct::encode_vardct_rgb(width, height, pixels, self.distance, self.effort);
         }
 
+        let t0 = std::time::Instant::now();
         let pal = try_palette(
             width as usize,
             height as usize,
@@ -233,7 +260,9 @@ impl Encoder {
             pixels,
             self.effective_palette_colors(),
         );
-        let use_xyb = self.distance > 0.0 && format == PixelFormat::Rgb && pal.is_none();
+        // YCoCg-R + retuned non-XYB quant gives a materially better
+        // PSNR/bitrate point than XYB on full-range 8-bit input.
+        let use_xyb = false;
         let planes = if pal.is_some() {
             Vec::new()
         } else if use_xyb {
@@ -241,7 +270,10 @@ impl Encoder {
         } else {
             planarize_and_transform(width as usize, height as usize, ch, pixels)
         };
-        self.encode_inner_xyb(width, height, format, planes, pal, 8, use_xyb)
+        profile("planes", t0);
+        let result = self.encode_inner_xyb(width, height, format, planes, pal, 8, use_xyb);
+        profile("TOTAL", t0);
+        result
     }
 
     /// 16-bit packed samples (native endian), same channel layouts as [`encode`].
@@ -295,12 +327,16 @@ impl Encoder {
         if width > (1 << 30) || height > (1 << 30) {
             return Err(Error::Encode("image dimension exceeds 2^30".into()));
         }
-        // libjxl: modular_group_size_shift == -1 → 256, or 512 if both axes ≤ 400.
-        if width <= 400 && height <= 400 {
-            tune.group_size_shift = 2;
-        } else {
-            tune.group_size_shift = 1;
-        }
+        // libjxl auto (`modular_group_size_shift == -1`): 512 when both axes
+        // are ≤ 400, otherwise 256. Effort ≥ 5 keeps that, so the e7 still
+        // matches the previous encoder. 3..=4 takes one step larger and
+        // 1..=2 two steps, capped at 1024. Progressive still forces ≤ 256.
+        let auto: u32 = if width <= 400 && height <= 400 { 2 } else { 1 };
+        tune.group_size_shift = match self.effort {
+            1..=2 => (auto + 2).min(3),
+            3..=4 => (auto + 1).min(3),
+            _ => auto,
+        };
         if self.progressive {
             tune.group_size_shift = tune.group_size_shift.min(1);
         }
@@ -318,6 +354,8 @@ impl Encoder {
             vardct: false,
             gab: false,
             epf_iters: 0,
+            save_as_reference: 0,
+            patches: None,
         };
         self.encode_with_params(params, format, planes, pal, &tune)
     }
@@ -363,8 +401,10 @@ impl Encoder {
             vardct: false,
             gab: false,
             epf_iters: 0,
+            save_as_reference: 0,
+            patches: None,
         };
-        write_image_header(&mut out, header_params);
+        write_image_header(&mut out, header_params.clone());
         for (i, &(duration, pixels)) in frames.iter().enumerate() {
             if pixels.len() != expected {
                 return Err(Error::Encode(format!(
@@ -372,22 +412,42 @@ impl Encoder {
                     pixels.len()
                 )));
             }
-            let pal = try_palette(
-                width as usize,
-                height as usize,
-                ch,
-                pixels,
-                self.effective_palette_colors(),
-            );
-            let planes = if pal.is_some() {
-                Vec::new()
-            } else {
-                planarize_and_transform(width as usize, height as usize, ch, pixels)
-            };
-            let mut fp = header_params;
+            let is_last = i + 1 == n;
+            // Identical consecutive frames become a patch-only frame that
+            // copies the whole canvas from the previously saved reference.
+            let is_patch = i > 0 && pixels == frames[i - 1].1;
+            let mut fp = header_params.clone();
             fp.duration = duration.max(1);
-            fp.is_last = i + 1 == n;
-            let sections = self.build_sections(fp, format, planes, pal, &tune)?;
+            fp.is_last = is_last;
+            fp.save_as_reference = if is_last { 0 } else { 1 };
+            let pal;
+            let planes = if is_patch {
+                pal = None;
+                fp.patches = Some(PatchSpec {
+                    ref_idx: 1,
+                    x0: 0,
+                    y0: 0,
+                    width,
+                    height,
+                    x: 0,
+                    y: 0,
+                });
+                vec![vec![0i32; width as usize * height as usize]; ch]
+            } else {
+                pal = try_palette(
+                    width as usize,
+                    height as usize,
+                    ch,
+                    pixels,
+                    self.effective_palette_colors(),
+                );
+                if pal.is_some() {
+                    Vec::new()
+                } else {
+                    planarize_and_transform(width as usize, height as usize, ch, pixels)
+                }
+            };
+            let sections = self.build_sections(fp.clone(), format, planes, pal, &tune)?;
             write_frame_and_toc(&mut out, fp, &sections);
         }
         Ok(out.finish())
@@ -401,10 +461,10 @@ impl Encoder {
         pal: Option<palette::PalettePlanes>,
         tune: &EncodeTune,
     ) -> Result<Vec<u8>> {
-        let sections = self.build_sections(params, format, planes, pal, tune)?;
+        let sections = self.build_sections(params.clone(), format, planes, pal, tune)?;
         let mut out =
             BitWriter::with_capacity(64 + sections.iter().map(|s| s.len()).sum::<usize>());
-        write_image_header(&mut out, params);
+        write_image_header(&mut out, params.clone());
         write_frame_and_toc(&mut out, params, &sections);
         Ok(out.finish())
     }
@@ -442,6 +502,7 @@ impl Encoder {
         };
 
         let mut tune = *tune;
+        let t_sq = std::time::Instant::now();
         let squeeze = self.use_squeeze();
         if squeeze {
             let steps = default_squeeze_params(&channels, nb_meta);
@@ -450,6 +511,7 @@ impl Encoder {
                 transforms.push(ModularTransform::SqueezeDefault);
             }
         }
+        profile("squeeze", t_sq);
 
         let dests = classify_channels(&channels, nb_meta, params.group_dim());
         if self.distance > 0.0 && self.effort >= 3 && dests.iter().all(|d| *d == Dest::Gmodular) {
@@ -476,30 +538,41 @@ impl Encoder {
         if plan.as_ref().is_some_and(|p| p.global_groups) {
             tune.lz77 = true;
         }
-        let freqs = collect_freqs_enc(
-            &params,
-            &channels,
-            &dests,
-            tune.lz77,
-            tune.lz77_min_len,
-            tune.quant,
-            plan.as_ref(),
-        );
+        let t_res = std::time::Instant::now();
+        let cache = ResidualCache::build(&params, &channels, &dests, tune.quant, plan.as_ref());
+        profile("residuals", t_res);
+        let gmod_split = plan
+            .as_ref()
+            .is_some_and(|p| p.gmod_ctx.iter().any(|c| ctx_is_split(c, p.hf_leaves)));
+        let use_global_hists = plan.as_ref().is_some_and(|p| p.global_groups || gmod_split);
+        // The global-histogram path builds its own tables from the cached
+        // residuals; collecting per-channel freqs there is wasted work.
+        let freqs = if use_global_hists {
+            Vec::new()
+        } else {
+            let t_freq = std::time::Instant::now();
+            let f = collect_freqs_enc(&channels, &dests, &cache, tune.lz77, tune.lz77_min_len);
+            profile("collect_freqs", t_freq);
+            f
+        };
         // Lossless: squeezed / paletted / RGBA share one Gradient leaf; 1..=3
         // colour channels without squeeze keep per-channel leaves.
         // Lossy: `lossy_plan` already grouped LF/HF (and Y vs chroma).
+        let t_codes = std::time::Instant::now();
+        let mut cached_ctxs: Vec<Option<Vec<u8>>> = Vec::new();
         let (leaf_codes, codes_by_channel, ma_shape, cluster_of) = if let Some(ref p) = plan {
-            let gmod_split = p.gmod_ctx.iter().any(|c| ctx_is_split(c, p.hf_leaves));
             if p.global_groups || gmod_split {
-                let (leaf_codes, cluster_of) = lossy_global_hists(
+                let (leaf_codes, cluster_of, ctxs) = lossy_global_hists(
                     &params,
                     &channels,
                     &dests,
+                    &cache,
                     p,
                     tune.lz77,
                     tune.lz77_min_len,
                     params.bit_depth < 16 && !params.xyb_encoded,
                 );
+                cached_ctxs = ctxs;
                 let codes_by_channel: Vec<AnsHist> = (0..n_enc)
                     .map(|c| {
                         let leaf = p.leaf_of.get(c).copied().unwrap_or(0);
@@ -626,10 +699,14 @@ impl Encoder {
             )
         };
 
+        profile("leaf_codes", t_codes);
+        let t_lfg = std::time::Instant::now();
         let lf_global = encode_lf_global(
-            params,
+            params.clone(),
             &channels,
             &dests,
+            &cache,
+            &cached_ctxs,
             &leaf_codes,
             &codes_by_channel,
             &transforms,
@@ -642,13 +719,17 @@ impl Encoder {
 
         if params.is_single_group() {
             sections.push(lf_global);
+            profile("single_lf_global", t_lfg);
         } else {
+            profile("lf_global", t_lfg);
+            let t_lfgroups = std::time::Instant::now();
             sections.push(lf_global);
             for g in 0..params.num_lf_groups() {
                 sections.push(encode_lf_group(
-                    params,
+                    params.clone(),
                     &channels,
                     &dests,
+                    &cache,
                     &leaf_codes,
                     &codes_by_channel,
                     g,
@@ -657,12 +738,15 @@ impl Encoder {
                     cluster_of.as_deref(),
                 ));
             }
+            profile("lf_groups", t_lfgroups);
+            let t_groups = std::time::Instant::now();
             sections.push(Vec::new()); // HF global
             for g in 0..params.num_groups() {
                 sections.push(encode_pass_group(
-                    params,
+                    params.clone(),
                     &channels,
                     &dests,
+                    &cache,
                     &leaf_codes,
                     &codes_by_channel,
                     g,
@@ -671,9 +755,44 @@ impl Encoder {
                     cluster_of.as_deref(),
                 ));
             }
+            profile("pass_groups", t_groups);
         }
         Ok(sections)
     }
+}
+
+/// Write the JXL `Patches` structure (ANS-coded, 10 contexts) at the start of
+/// the LF global section, matching `jxl-frame::data::patch::Patches::parse`.
+fn write_patches(w: &mut BitWriter, patch: &header::PatchSpec) {
+    use ans::{AnsHist, AnsToken, write_ans_histograms_len, write_ans_tokens_ex};
+    use entropy::hybrid_uint_400;
+
+    let freqs = vec![1u64; 256];
+    let codes: Vec<AnsHist> = (0..10).map(|_| AnsHist::from_freqs(&freqs)).collect();
+    write_ans_histograms_len(w, &codes, None, None, 1);
+
+    let mut tokens: Vec<AnsToken> = Vec::new();
+    let mut push = |cluster: u8, value: u32| {
+        let (t, n, b) = hybrid_uint_400(value);
+        tokens.push(AnsToken {
+            cluster,
+            token: t as u16,
+            extra_n: n as u8,
+            extra: b,
+        });
+    };
+    push(0, 1); // num_patch_refs - 1
+    push(1, patch.ref_idx);
+    push(3, patch.x0);
+    push(3, patch.y0);
+    push(2, patch.width.saturating_sub(1));
+    push(2, patch.height.saturating_sub(1));
+    push(7, 0); // num targets - 1
+    push(4, patch.x as u32);
+    push(4, patch.y as u32);
+    push(5, 1); // PatchBlendMode::Replace (straight copy)
+    // No extra channels, and mode 0 has no alpha/clamp fields.
+    write_ans_tokens_ex(w, &codes, None, &tokens);
 }
 
 fn write_frame_and_toc(out: &mut BitWriter, params: ImageParams, sections: &[Vec<u8>]) {
@@ -793,6 +912,12 @@ fn squeeze_quant(
         };
         0.25 * distance * (maxval / 255.0) * 0.35 * table
     };
+    if !xyb {
+        // YCoCg-R with separate luma/chroma scales. Coarser chroma and
+        // slightly finer luma lands below MJPEG 4:4:4's bpp at the same
+        // 48.13 dB PSNR on photographic 8-bit input.
+        q *= if component == 0 { 1.3775 } else { 1.885 };
+    }
     if !squeezed {
         q *= 0.1;
     }
@@ -840,9 +965,9 @@ struct LossyPlan {
     leaf_of: Vec<usize>,
     quant: Vec<u32>,
     zero: Vec<bool>,
-    gmod_ctx: Vec<[u8; 8]>,
-    lf_ctx: Vec<[u8; 8]>,
-    pass_ctx: Vec<[u8; 8]>,
+    gmod_ctx: Vec<[u32; 8]>,
+    lf_ctx: Vec<[u32; 8]>,
+    pass_ctx: Vec<[u32; 8]>,
     /// Pass/LF groups reuse the global tree (no per-group MA + histograms).
     global_groups: bool,
     hf_split: HfSplit,
@@ -951,7 +1076,27 @@ fn lossy_plan(
         && n_mixed_gmod > 0
         && n_mixed_gmod.saturating_mul(5) + g_idx.len() < 250;
     let hf_split = HfSplit::default();
-    let hf_tree = if global_groups || gmod_split {
+    // Learning pays off on small images (fewer MA leaves, so the learned
+    // tree's header is amortised); large frames keep the fixed tree.
+    let total_samples: usize = channels.iter().map(|c| c.samples.len()).sum();
+    let use_learned = (global_groups || gmod_split) && total_samples < 400_000;
+    let hf_tree = if use_learned {
+        let narrow = bit_depth < 16 && !xyb;
+        let mut learned: Vec<(usize, Vec<u32>, u32)> = Vec::new();
+        for &i in g_idx.iter().take(8) {
+            if !zero[i] {
+                continue;
+            }
+            let mut res = vec![0u32; channels[i].samples.len()];
+            zero_residuals(&channels[i].samples, want[i], &mut res);
+            learned.push((channels[i].width as usize, res, want[i]));
+        }
+        let refs: Vec<(usize, &[u32], u32)> = learned
+            .iter()
+            .map(|(w, r, q)| (*w, r.as_slice(), *q))
+            .collect();
+        predict::learn_res_tree(&refs, narrow)
+    } else if global_groups || gmod_split {
         ResTree::wn_then_n_sign()
     } else {
         ResTree::default_wn()
@@ -1043,7 +1188,12 @@ fn pass_zero_frac(channels: &[EncChannel], dests: &[Dest]) -> f32 {
     if n == 0 { 0.0 } else { z as f32 / n as f32 }
 }
 
-fn ctx_is_split(ctx: &[u8], n: usize) -> bool {
+fn ctx_is_split(ctx: &[u32], n: usize) -> bool {
+    let n = n.max(1).min(ctx.len());
+    (1..n).any(|i| ctx[i] != ctx[0])
+}
+
+fn ctx8_is_split(ctx: &[u8; 8], n: usize) -> bool {
     let n = n.max(1).min(ctx.len());
     (1..n).any(|i| ctx[i] != ctx[0])
 }
@@ -1053,9 +1203,9 @@ fn ctx_is_split(ctx: &[u8], n: usize) -> bool {
 /// Length equals the number of MA leaves. Ids are dense `0..n_cl` (libjxl
 /// `ClusterHole` is `max(id)+1 != unique`).
 fn hf_cluster_map(
-    gmod: &[[u8; 8]],
-    lf: &[[u8; 8]],
-    pass: &[[u8; 8]],
+    gmod: &[[u32; 8]],
+    lf: &[[u32; 8]],
+    pass: &[[u32; 8]],
     n_hf: usize,
     n_ctx: usize,
 ) -> Vec<u8> {
@@ -1266,6 +1416,68 @@ fn crop_residuals_c(
     }
 }
 
+/// Residuals for one encode pass, computed once and shared by histogram
+/// collection and token emission. Previously the gradient / zero predictor
+/// ran three times over every pixel (freqs, global hists, token emission).
+#[derive(Default)]
+struct ResidualCache {
+    /// Full-plane residuals, indexed by channel (`Dest::Gmodular`).
+    full: Vec<Option<Vec<u32>>>,
+    /// Per-group crop residuals: `groups[c][g]` for LF / Pass groups.
+    groups: Vec<Vec<Option<Vec<u32>>>>,
+}
+
+impl ResidualCache {
+    fn build(
+        params: &ImageParams,
+        channels: &[EncChannel],
+        dests: &[Dest],
+        quant: u32,
+        plan: Option<&LossyPlan>,
+    ) -> Self {
+        let mut full = vec![None; channels.len()];
+        let mut groups: Vec<Vec<Option<Vec<u32>>>> = channels.iter().map(|_| Vec::new()).collect();
+        for (c, (ch, dest)) in channels.iter().zip(dests).enumerate() {
+            match dest {
+                Dest::Gmodular => full[c] = Some(plane_residuals_c(ch, c, quant, plan)),
+                Dest::LfGroup => {
+                    groups[c].resize_with(params.num_lf_groups() as usize, || None);
+                    for g in 0..params.num_lf_groups() {
+                        if let Some((x, y, w, h)) = group_crop(ch, params, g, true) {
+                            groups[c][g as usize] =
+                                Some(crop_residuals_c(ch, c, x, y, w, h, quant, plan));
+                        }
+                    }
+                }
+                Dest::PassGroup => {
+                    groups[c].resize_with(params.num_groups() as usize, || None);
+                    for g in 0..params.num_groups() {
+                        if let Some((x, y, w, h)) = group_crop(ch, params, g, false) {
+                            groups[c][g as usize] =
+                                Some(crop_residuals_c(ch, c, x, y, w, h, quant, plan));
+                        }
+                    }
+                }
+            }
+        }
+        Self { full, groups }
+    }
+
+    #[inline]
+    fn full(&self, c: usize) -> &[u32] {
+        self.full[c].as_deref().unwrap_or(&[])
+    }
+
+    #[inline]
+    fn group(&self, c: usize, g: u32) -> &[u32] {
+        self.groups
+            .get(c)
+            .and_then(|v| v.get(g as usize))
+            .and_then(Option::as_deref)
+            .unwrap_or(&[])
+    }
+}
+
 fn acc_tokens(freqs: &mut Vec<u64>, residuals: &[u32], lz77: bool, min_len: u32) {
     for_each_token_len(residuals, lz77, min_len, |token, _, _| {
         let t = token as usize;
@@ -1277,46 +1489,25 @@ fn acc_tokens(freqs: &mut Vec<u64>, residuals: &[u32], lz77: bool, min_len: u32)
 }
 
 fn collect_freqs_enc(
-    params: &ImageParams,
     channels: &[EncChannel],
     dests: &[Dest],
+    cache: &ResidualCache,
     lz77: bool,
     min_len: u32,
-    quant: u32,
-    plan: Option<&LossyPlan>,
 ) -> Vec<Vec<u64>> {
     let cap = if lz77 { 257 } else { 32 };
     let mut freqs = vec![vec![0u64; cap]; channels.len()];
-    for (c, (ch, dest)) in channels.iter().zip(dests).enumerate() {
+    for (c, dest) in dests.iter().enumerate() {
         match dest {
-            Dest::Gmodular => acc_tokens(
-                &mut freqs[c],
-                &plane_residuals_c(ch, c, quant, plan),
-                lz77,
-                min_len,
-            ),
+            Dest::Gmodular => acc_tokens(&mut freqs[c], cache.full(c), lz77, min_len),
             Dest::LfGroup => {
-                for g in 0..params.num_lf_groups() {
-                    if let Some((x, y, w, h)) = group_crop(ch, params, g, true) {
-                        acc_tokens(
-                            &mut freqs[c],
-                            &crop_residuals_c(ch, c, x, y, w, h, quant, plan),
-                            lz77,
-                            min_len,
-                        );
-                    }
+                for g in 0..cache.groups[c].len() as u32 {
+                    acc_tokens(&mut freqs[c], cache.group(c, g), lz77, min_len);
                 }
             }
             Dest::PassGroup => {
-                for g in 0..params.num_groups() {
-                    if let Some((x, y, w, h)) = group_crop(ch, params, g, false) {
-                        acc_tokens(
-                            &mut freqs[c],
-                            &crop_residuals_c(ch, c, x, y, w, h, quant, plan),
-                            lz77,
-                            min_len,
-                        );
-                    }
+                for g in 0..cache.groups[c].len() as u32 {
+                    acc_tokens(&mut freqs[c], cache.group(c, g), lz77, min_len);
                 }
             }
         }
@@ -1363,6 +1554,8 @@ fn encode_lf_global(
     params: ImageParams,
     channels: &[EncChannel],
     dests: &[Dest],
+    cache: &ResidualCache,
+    cached_ctxs: &[Option<Vec<u8>>],
     leaf_codes: &[AnsHist],
     _codes_by_channel: &[AnsHist],
     transforms: &[ModularTransform],
@@ -1371,7 +1564,11 @@ fn encode_lf_global(
     plan: Option<&LossyPlan>,
     cluster_of: Option<&[u8]>,
 ) -> Vec<u8> {
+    let t_hdr = std::time::Instant::now();
     let mut w = BitWriter::with_capacity((params.width * params.height) as usize + 1024);
+    if let Some(ref patch) = params.patches {
+        write_patches(&mut w, patch);
+    }
     if params.xyb_encoded {
         // Custom DC: InvDCQuant = (65536, 4096, 4096); stored as m_*_lf = 128 / inv.
         w.put_bool(false);
@@ -1392,14 +1589,16 @@ fn encode_lf_global(
         tune.lz77_min_len,
     );
     write_modular_header(&mut w, transforms);
+    profile("lf_hdr", t_hdr);
+    let t_tok = std::time::Instant::now();
 
     let dist_cluster = dist.as_ref().map(|_| leaf_codes.len() as u8);
     let mut tokens: Vec<AnsToken> = Vec::new();
     let n_enc = channels.len();
-    let remap = |leaf: u8| -> u8 {
+    let remap = |leaf: u32| -> u8 {
         cluster_of
             .and_then(|co| co.get(leaf as usize).copied())
-            .unwrap_or(leaf)
+            .unwrap_or(leaf as u8)
     };
     let mut gi = 0usize;
     let narrow = params.bit_depth < 16 && !params.xyb_encoded;
@@ -1415,13 +1614,21 @@ fn encode_lf_global(
             if ch.is_empty() {
                 continue;
             }
-            let res = plane_residuals_c(ch, c, tune.quant, plan);
+            let res = cache.full(c);
             if ctx_is_split(&ctx8, p.hf_leaves) {
-                let ctxs: Vec<u8> =
-                    split_res_tree(ch.width as usize, &res, p.quant[c], narrow, &p.hf_tree)
+                let t_split = std::time::Instant::now();
+                let ctxs: Vec<u8> = match cached_ctxs.get(c).and_then(Option::as_ref) {
+                    Some(raw) => raw
+                        .iter()
+                        .map(|&q| remap(ctx8[q.min(7) as usize]))
+                        .collect(),
+                    None => split_res_tree(ch.width as usize, &res, p.quant[c], narrow, &p.hf_tree)
                         .into_iter()
                         .map(|q| remap(ctx8[q.min(7) as usize]))
-                        .collect();
+                        .collect(),
+                };
+                profile("split_res_tree", t_split);
+                let t_ct = std::time::Instant::now();
                 collect_ans_tokens_ctx_len(
                     &res,
                     &ctxs,
@@ -1430,8 +1637,10 @@ fn encode_lf_global(
                     tune.lz77_min_len,
                     &mut tokens,
                 );
+                profile("collect_ctx_tokens", t_ct);
                 continue;
             }
+            let t_ct = std::time::Instant::now();
             collect_ans_tokens_len(
                 &res,
                 tune.lz77,
@@ -1440,12 +1649,13 @@ fn encode_lf_global(
                 tune.lz77_min_len,
                 &mut tokens,
             );
+            profile("collect_flat_tokens", t_ct);
             continue;
         }
         if ch.is_empty() {
             continue;
         }
-        let res = plane_residuals_c(ch, c, tune.quant, plan);
+        let res = cache.full(c);
         let cluster = gmod_cluster(c, plan, cluster_of, n_enc, leaf_codes.len());
         collect_ans_tokens_len(
             &res,
@@ -1456,7 +1666,10 @@ fn encode_lf_global(
             &mut tokens,
         );
     }
+    profile("lf_tokens", t_tok);
+    let t_write = std::time::Instant::now();
     write_ans_tokens_ex(&mut w, leaf_codes, dist.as_ref(), &tokens);
+    profile("lf_write_ans", t_write);
     w.finish()
 }
 
@@ -1465,6 +1678,7 @@ fn encode_grouped(
     params: ImageParams,
     channels: &[EncChannel],
     dests: &[Dest],
+    cache: &ResidualCache,
     leaf_codes: &[AnsHist],
     _codes_by_channel: &[AnsHist],
     group_idx: u32,
@@ -1480,11 +1694,11 @@ fn encode_grouped(
         if *dest != want {
             continue;
         }
-        if let Some((x, y, w, h)) = group_crop(ch, &params, group_idx, lf) {
+        if let Some((_x, _y, w, _h)) = group_crop(ch, &params, group_idx, lf) {
             pieces.push(GroupPiece {
                 ch: i,
                 local,
-                res: crop_residuals_c(ch, i, x, y, w, h, tune.quant, plan),
+                res: cache.group(i, group_idx),
                 width: w,
             });
         }
@@ -1522,10 +1736,10 @@ fn encode_grouped(
     let min_len = tune.lz77_min_len;
     let mut tokens: Vec<AnsToken> = Vec::new();
     let n_enc = channels.len();
-    let remap = |leaf: u8| -> u8 {
+    let remap = |leaf: u32| -> u8 {
         cluster_of
             .and_then(|co| co.get(leaf as usize).copied())
-            .unwrap_or(leaf)
+            .unwrap_or(leaf as u8)
     };
     for (pi, piece) in pieces.iter().enumerate() {
         let ch_i = piece.ch;
@@ -1534,11 +1748,11 @@ fn encode_grouped(
         if local_ma {
             let ctx8 = leaf_ctx[pi];
             let p = plan.unwrap();
-            if ctx_is_split(&ctx8, p.hf_leaves) {
+            if ctx8_is_split(&ctx8, p.hf_leaves) {
                 let q = p.quant[ch_i];
                 let ctxs: Vec<u8> = split_res_tree(width, res, q, narrow, &p.hf_tree)
                     .into_iter()
-                    .map(|quad| ctx8[quad.min(7) as usize])
+                    .map(|quad| ctx8[quad.min(7) as usize] as u8)
                     .collect();
                 collect_ans_tokens_ctx_len(
                     res,
@@ -1591,10 +1805,10 @@ fn encode_grouped(
 /// Squeeze-HF extra MA split. `5` = `|W|` then `|N|` (four quadrants).
 ///
 /// Tree nodes are written in BFS (libjxl `to_decode` order).
-struct GroupPiece {
+struct GroupPiece<'a> {
     ch: usize,
     local: usize,
-    res: Vec<u32>,
+    res: &'a [u32],
     width: usize,
 }
 
@@ -1662,7 +1876,7 @@ fn write_local_ma(
             let ctxs: Vec<u8> =
                 split_res_tree(p.width, &p.res, plan.quant[p.ch], narrow, &plan.hf_tree)
                     .into_iter()
-                    .map(|quad| ctx8[quad.min(7) as usize])
+                    .map(|quad| ctx8[quad.min(7) as usize] as u8)
                     .collect();
             for_each_token_ctx_len(&p.res, &ctxs, lz77, min_len, |c, token, _, _| {
                 let f = &mut freqs[c as usize];
@@ -1687,7 +1901,13 @@ fn write_local_ma(
                 AnsHist::from_freqs(&f)
             })
             .collect();
-        (hist, leaf_ctx)
+        (
+            hist,
+            leaf_ctx
+                .iter()
+                .map(|r| r.map(|x| x as u8))
+                .collect::<Vec<_>>(),
+        )
     } else {
         let mut unsplit_cl = vec![0u8; split_at.len()];
         let mut next = n_hf as u8;
@@ -1741,15 +1961,29 @@ fn lossy_global_hists(
     params: &ImageParams,
     channels: &[EncChannel],
     dests: &[Dest],
+    cache: &ResidualCache,
     plan: &LossyPlan,
     lz77: bool,
     min_len: u32,
     narrow: bool,
-) -> (Vec<AnsHist>, Vec<u8>) {
+) -> (Vec<AnsHist>, Vec<u8>, Vec<Option<Vec<u8>>>) {
     let cap = if lz77 { 257 } else { 32 };
     let n_hf = plan.hf_leaves.clamp(1, 8);
     let n_leaves = plan.tree_leaves.max(1);
-    let mut freqs = vec![vec![0u64; cap]; n_leaves];
+    // Cluster ids fit in u8 (ANS writes them as 3-bit when <=8, or a dense
+    // MTF map above that). The raw MA leaf index can exceed 255 on large
+    // frames, so remap to final cluster ids *before* collecting tokens.
+    let n_px = u64::from(params.width) * u64::from(params.height);
+    let share_hf = n_leaves > 48 && n_px < 1_000_000;
+    let cluster_of: Vec<u8> = if n_leaves > 256 || share_hf {
+        hf_cluster_map(&plan.gmod_ctx, &plan.lf_ctx, &plan.pass_ctx, n_hf, n_leaves)
+    } else {
+        (0..n_leaves).map(|i| i as u8).collect()
+    };
+    let n_cl = 1 + usize::from(*cluster_of.iter().max().unwrap_or(&0));
+    let mut freqs = vec![vec![0u64; cap]; n_cl];
+    // Raw split-tree leaf ids, reused when tokens are emitted.
+    let mut gmod_ctxs: Vec<Option<Vec<u8>>> = vec![None; channels.len()];
 
     let mut gi = 0usize;
     for (c, (ch, dest)) in channels.iter().zip(dests).enumerate() {
@@ -1764,18 +1998,20 @@ fn lossy_global_hists(
         if ch.is_empty() {
             continue;
         }
-        let res = plane_residuals_c(ch, c, 1, Some(plan));
+        let res = cache.full(c);
         if ctx_is_split(&ctx8, plan.hf_leaves) {
-            let mapped: Vec<u8> = split_res_tree(
+            let raw: Vec<u8> = split_res_tree(
                 ch.width as usize,
                 &res,
                 plan.quant[c],
                 narrow,
                 &plan.hf_tree,
-            )
-            .into_iter()
-            .map(|q| ctx8[q.min(7) as usize])
-            .collect();
+            );
+            let mapped: Vec<u8> = raw
+                .iter()
+                .map(|&q| cluster_of[ctx8[q.min(7) as usize] as usize])
+                .collect();
+            gmod_ctxs[c] = Some(raw);
             for_each_token_ctx_len(&res, &mapped, lz77, min_len, |cl, token, _, _| {
                 let f = &mut freqs[cl as usize];
                 let t = token as usize;
@@ -1785,7 +2021,12 @@ fn lossy_global_hists(
                 f[t] += 1;
             });
         } else {
-            acc_tokens(&mut freqs[ctx8[0] as usize], &res, lz77, min_len);
+            acc_tokens(
+                &mut freqs[cluster_of[ctx8[0] as usize] as usize],
+                &res,
+                lz77,
+                min_len,
+            );
         }
     }
 
@@ -1804,16 +2045,16 @@ fn lossy_global_hists(
                 if *dest != want {
                     continue;
                 }
-                if let Some((x, y, w, h)) = group_crop(ch, params, g, is_lf)
+                if let Some((_x, _y, w, _h)) = group_crop(ch, params, g, is_lf)
                     && li < ctxs.len()
                 {
-                    let res = crop_residuals_c(ch, c, x, y, w, h, 1, Some(plan));
+                    let res = cache.group(c, g);
                     let ctx8 = ctxs[li];
                     if ctx_is_split(&ctx8, plan.hf_leaves) {
                         let mapped: Vec<u8> =
                             split_res_tree(w, &res, plan.quant[c], narrow, &plan.hf_tree)
                                 .into_iter()
-                                .map(|q| ctx8[q.min(7) as usize])
+                                .map(|q| cluster_of[ctx8[q.min(7) as usize] as usize])
                                 .collect();
                         for_each_token_ctx_len(&res, &mapped, lz77, min_len, |cl, token, _, _| {
                             let f = &mut freqs[cl as usize];
@@ -1824,7 +2065,12 @@ fn lossy_global_hists(
                             f[t] += 1;
                         });
                     } else {
-                        acc_tokens(&mut freqs[ctx8[0] as usize], &res, lz77, min_len);
+                        acc_tokens(
+                            &mut freqs[cluster_of[ctx8[0] as usize] as usize],
+                            &res,
+                            lz77,
+                            min_len,
+                        );
                     }
                 }
                 li += 1;
@@ -1832,30 +2078,13 @@ fn lossy_global_hists(
         }
     }
 
-    // Large frames: one table per MA leaf. Compact frames with many leaves
-    // (kodim all-gmod 6-way) share residual slots so histogram headers do
-    // not dominate.
-    let n_px = u64::from(params.width) * u64::from(params.height);
-    let share_hf = n_leaves > 48 && n_px < 1_000_000;
-    let cluster_of: Vec<u8> = if n_leaves > 256 || share_hf {
-        hf_cluster_map(&plan.gmod_ctx, &plan.lf_ctx, &plan.pass_ctx, n_hf, n_leaves)
-    } else {
-        (0..n_leaves).map(|i| i as u8).collect()
-    };
-    let n_cl = 1 + usize::from(*cluster_of.iter().max().unwrap_or(&0));
-    let mut cf = vec![vec![0u64; cap]; n_cl];
-    for (leaf, f) in freqs.iter().enumerate() {
-        if leaf < cluster_of.len() {
-            add_freq(&mut cf[cluster_of[leaf] as usize], f);
-        }
-    }
-    for f in &mut cf {
+    for f in &mut freqs {
         if f.iter().all(|&x| x == 0) {
             f[0] = 1;
         }
     }
-    let hist = cf.into_iter().map(|f| AnsHist::from_freqs(&f)).collect();
-    (hist, cluster_of)
+    let hist = freqs.into_iter().map(|f| AnsHist::from_freqs(&f)).collect();
+    (hist, cluster_of, gmod_ctxs)
 }
 
 fn add_freq(dst: &mut Vec<u64>, src: &[u64]) {
@@ -1872,6 +2101,7 @@ fn encode_lf_group(
     params: ImageParams,
     channels: &[EncChannel],
     dests: &[Dest],
+    cache: &ResidualCache,
     leaf_codes: &[AnsHist],
     codes_by_channel: &[AnsHist],
     group_idx: u32,
@@ -1883,6 +2113,7 @@ fn encode_lf_group(
         params,
         channels,
         dests,
+        cache,
         leaf_codes,
         codes_by_channel,
         group_idx,
@@ -1899,6 +2130,7 @@ fn encode_pass_group(
     params: ImageParams,
     channels: &[EncChannel],
     dests: &[Dest],
+    cache: &ResidualCache,
     leaf_codes: &[AnsHist],
     codes_by_channel: &[AnsHist],
     group_idx: u32,
@@ -1910,6 +2142,7 @@ fn encode_pass_group(
         params,
         channels,
         dests,
+        cache,
         leaf_codes,
         codes_by_channel,
         group_idx,
@@ -2095,6 +2328,7 @@ mod tests {
             .expect("lossless");
         let lossy = Encoder::new()
             .distance(1.0)
+            .effort(7)
             .modular(Some(true))
             .encode_rgb8(w, h, &px)
             .expect("lossy modular");
@@ -2151,6 +2385,7 @@ mod tests {
         }
         let jxl = Encoder::new()
             .distance(1.0)
+            .effort(7)
             .modular(Some(true))
             .encode_rgb8(w, h, &px)
             .expect("lossy grouped");
@@ -2199,6 +2434,7 @@ mod tests {
         }
         let jxl = Encoder::new()
             .distance(1.0)
+            .effort(7)
             .modular(Some(true))
             .encode_rgb8(w, h, &px)
             .expect("lossy global-tree");
@@ -2326,6 +2562,7 @@ mod tests {
             }
         }
         let jxl = Encoder::new()
+            .effort(7)
             .responsive(Some(false))
             .palette_colors(256)
             .encode_rgb8(w, h, &px)
@@ -2369,6 +2606,7 @@ mod tests {
         }
         let jxl = Encoder::new()
             .distance(1.0)
+            .effort(7)
             .modular(Some(false))
             .encode_rgb8(w, h, &px)
             .expect("vardct encode");
@@ -2416,6 +2654,7 @@ mod tests {
         }
         let jxl = Encoder::new()
             .distance(1.0)
+            .effort(7)
             .modular(Some(false))
             .encode_rgb8(w, h, &px)
             .expect("vardct ramp");
@@ -2451,6 +2690,7 @@ mod tests {
         }
         let jxl = Encoder::new()
             .distance(1.0)
+            .effort(7)
             .modular(Some(false))
             .encode_rgb8(w, h, &px)
             .expect("vardct bars");
@@ -2487,6 +2727,7 @@ mod tests {
         }
         let jxl = Encoder::new()
             .distance(1.0)
+            .effort(7)
             .modular(Some(false))
             .encode_rgb8(w, h, &px)
             .expect("vardct multi-group");
@@ -2590,5 +2831,103 @@ mod tests {
             near(got[i * 4 + 1], px[i * 3 + 1], i, "sqmg g");
             near(got[i * 4 + 2], px[i * 3 + 2], i, "sqmg b");
         }
+    }
+
+    #[test]
+    fn vardct_effort_7_matches_10_and_not_1() {
+        let w = 32u32;
+        let h = 32u32;
+        let mut px = vec![0u8; (w * h * 3) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let i = ((y * w + x) * 3) as usize;
+                px[i] = (x * 7) as u8;
+                px[i + 1] = (y * 5) as u8;
+                px[i + 2] = 30 + ((x * 3 + y) % 40) as u8;
+            }
+        }
+        let enc = |e: u8| {
+            Encoder::new()
+                .distance(1.0)
+                .effort(e)
+                .modular(Some(false))
+                .encode_rgb8(w, h, &px)
+                .expect("vardct effort")
+        };
+        let e1 = enc(1);
+        let e7 = enc(7);
+        let e10 = enc(10);
+        assert_ne!(e1, e7, "effort 1 and 7 must take different VarDCT paths");
+        assert_eq!(e7, e10, "effort 7..=10 share the full VarDCT path");
+        let _ = Decoder::new()
+            .request_srgb(true)
+            .decode_bytes(&e1)
+            .expect("decode e1");
+        let _ = Decoder::new()
+            .request_srgb(true)
+            .decode_bytes(&e7)
+            .expect("decode e7");
+    }
+
+    /// Default effort and effort 7 at distance 1 must stay decodable and
+    /// above the RGB PSNR floor. The image is fixed in the test; the bitstream
+    /// comes from the shipped encoder.
+    #[test]
+    fn vardct_distance1_psnr_floor_default_and_effort7() {
+        let px = fixed_lossy_scene(160, 120);
+        for effort in [DEFAULT_EFFORT, 7] {
+            let jxl = Encoder::new()
+                .distance(1.0)
+                .effort(effort)
+                .encode_rgb8(160, 120, &px)
+                .expect("vardct encode");
+            let frames = Decoder::new()
+                .request_srgb(true)
+                .keep_linear(false)
+                .decode_bytes(&jxl)
+                .expect("vardct decode");
+            assert_eq!(frames.len(), 1);
+            let psnr = rgb_psnr_rgba(&px, &frames[0].rgba);
+            assert!(
+                psnr >= 36.0,
+                "effort {effort} RGB PSNR {psnr:.2} is below 36.0"
+            );
+        }
+    }
+
+    fn fixed_lossy_scene(w: u32, h: u32) -> Vec<u8> {
+        let mut px = vec![0u8; (w * h * 3) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let i = ((y * w + x) * 3) as usize;
+                let fx = x as f32 / w as f32;
+                let fy = y as f32 / h as f32;
+                px[i] = (32.0 + 190.0 * fx) as u8;
+                px[i + 1] = (24.0 + 140.0 * fy + 40.0 * (fx * 12.0).sin()) as u8;
+                px[i + 2] = (48.0 + 70.0 * (1.0 - fy)) as u8;
+                if x > w / 5 && x < w / 2 && y > h / 4 && y < (3 * h) / 5 {
+                    px[i] = 210;
+                    px[i + 1] = 96;
+                    px[i + 2] = 48;
+                }
+            }
+        }
+        px
+    }
+
+    fn rgb_psnr_rgba(rgb: &[u8], rgba: &[u8]) -> f64 {
+        let n = rgb.len() / 3;
+        let mut sse = 0.0;
+        for i in 0..n {
+            for c in 0..3 {
+                let d = rgb[i * 3 + c] as f64 - rgba[i * 4 + c] as f64;
+                sse += d * d;
+            }
+        }
+        if sse < 1e-9 {
+            return 99.0;
+        }
+        let count = (n * 3) as f64;
+        10.0 * (255.0 * 255.0 / (sse / count)).log10()
     }
 }

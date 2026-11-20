@@ -7,8 +7,8 @@
 
 use super::bits::BitWriter;
 use super::entropy::{
-    LZ77_MIN_LENGTH, for_each_token, for_each_token_ctx, for_each_token_ctx_len, write_cluster_map,
-    write_integer_config_400, write_lz77_header_len,
+    LZ77_MIN_LENGTH, LZ77_MIN_SYMBOL, for_each_token, for_each_token_ctx, for_each_token_ctx_len,
+    for_each_token_len, write_cluster_map, write_integer_config_400, write_lz77_header_len,
 };
 
 const ANS_LOG: u32 = 12;
@@ -25,7 +25,10 @@ const RECIP_PREC: u32 = 32 + ANS_LOG;
 pub struct AnsHist {
     freq: Vec<u16>,
     ifreq: Vec<u64>,
-    reverse_map: Vec<Vec<u16>>,
+    /// Start of each symbol's slots in `rev_flat`.
+    rev_off: Vec<u32>,
+    /// `reverse_map[symbol][offset]` packed into one buffer.
+    rev_flat: Vec<u16>,
     alphabet: u32,
     kind: HistKind,
 }
@@ -41,8 +44,10 @@ enum HistKind {
 #[derive(Clone, Copy, Debug)]
 pub struct AnsToken {
     pub cluster: u8,
-    pub token: u32,
-    pub extra_n: u32,
+    /// HybridUint400 symbol (< 48, or 224..=267 for LZ77 length).
+    pub token: u16,
+    /// Number of extra bits (<= 31).
+    pub extra_n: u8,
     pub extra: u32,
 }
 
@@ -128,27 +133,32 @@ impl AnsHist {
             .map(|i| i + 1)
             .unwrap_or(1) as u32;
         let mut ifreq = vec![0u64; TABLE];
-        let mut reverse_map = vec![Vec::new(); TABLE];
+        // Flat reverse map: 256 inner Vec allocations per histogram used to
+        // dominate small-image encode time. One allocation, offsets computed
+        // from the frequency table, is enough.
+        let mut rev_off = vec![0u32; TABLE];
+        let mut cursor = 0u32;
         for (s, &f) in freq.iter().enumerate() {
+            rev_off[s] = cursor;
+            cursor += u32::from(f);
             if f > 0 {
                 ifreq[s] = ((1u64 << RECIP_PREC) + u64::from(f) - 1) / u64::from(f);
-                reverse_map[s] = vec![0u16; f as usize];
             }
         }
-        fill_reverse_map(&freq, &mut reverse_map);
+        debug_assert_eq!(cursor, ANS_TAB);
+        let mut rev_flat = vec![0u16; ANS_TAB as usize];
+        fill_reverse_map(&freq, &rev_off, &mut rev_flat);
         debug_assert!(
             {
                 let mut seen = vec![false; ANS_TAB as usize];
                 let mut ok = true;
-                for rm in &reverse_map {
-                    for &slot in rm {
-                        let i = slot as usize;
-                        if i >= seen.len() || seen[i] {
-                            ok = false;
-                            break;
-                        }
-                        seen[i] = true;
+                for &slot in &rev_flat {
+                    let i = slot as usize;
+                    if i >= seen.len() || seen[i] {
+                        ok = false;
+                        break;
                     }
+                    seen[i] = true;
                 }
                 ok && seen.iter().all(|&b| b)
             },
@@ -157,7 +167,8 @@ impl AnsHist {
         Self {
             freq,
             ifreq,
-            reverse_map,
+            rev_off,
+            rev_flat,
             alphabet,
             kind,
         }
@@ -171,7 +182,8 @@ impl AnsHist {
             debug_assert_eq!(self.freq[token as usize], ANS_TAB as u16);
             return (0, 0);
         }
-        let f = u32::from(self.freq[token as usize]);
+        let ti = token as usize;
+        let f = u32::from(self.freq[ti]);
         debug_assert!(f > 0, "ANS token {token} has freq 0");
         let mut nbits = 0u8;
         let mut bits = 0u16;
@@ -180,12 +192,23 @@ impl AnsHist {
             *state >>= 16;
             nbits = 16;
         }
-        let v = *state / f;
-        let off = *state % f;
-        let slot = self.reverse_map[token as usize][off as usize];
+        let v = div_recip(*state, f, self.ifreq[ti]);
+        let off = (*state - v * f) as usize;
+        let slot = self.rev_flat[self.rev_off[ti] as usize + off];
         *state = (v << ANS_LOG) + u32::from(slot);
         (bits, nbits)
     }
+}
+
+/// `ifreq` is `ceil(2^RECIP_PREC / f)`. Exact for every `f` in `1..=4096`.
+#[inline(always)]
+fn div_recip(state: u32, f: u32, ifreq: u64) -> u32 {
+    let mut v = ((u128::from(state) * u128::from(ifreq)) >> RECIP_PREC) as u32;
+    if u64::from(v) * u64::from(f) > u64::from(state) {
+        v -= 1;
+    }
+    debug_assert_eq!(v, state / f, "reciprocal div f={f} state={state}");
+    v
 }
 
 #[derive(Clone, Copy)]
@@ -195,7 +218,7 @@ struct Bucket {
     alias_cutoff: u16,
 }
 
-fn fill_reverse_map(freq: &[u16], reverse_map: &mut [Vec<u16>]) {
+fn fill_reverse_map(freq: &[u16], rev_off: &[u32], rev_flat: &mut [u16]) {
     let mut buckets = vec![
         Bucket {
             alias_symbol: 0,
@@ -251,9 +274,11 @@ fn fill_reverse_map(freq: &[u16], reverse_map: &mut [Vec<u16>]) {
         } else {
             (i as u32, pos)
         };
-        let rm = &mut reverse_map[sym as usize];
-        if (off as usize) < rm.len() {
-            rm[off as usize] = idx as u16;
+        let f = u32::from(freq[sym as usize]);
+        if off < f {
+            let slot = rev_off[sym as usize] as usize + off as usize;
+            debug_assert!(slot < rev_flat.len());
+            rev_flat[slot] = idx as u16;
         }
     }
 }
@@ -526,6 +551,28 @@ pub fn write_ans_tokens(w: &mut BitWriter, hists: &[AnsHist], tokens: &[AnsToken
     write_ans_tokens_ex(w, hists, None, tokens);
 }
 
+#[inline(always)]
+fn push_ans_bits(
+    chunks: &mut Vec<u64>,
+    allbits: &mut u64,
+    numall: &mut u32,
+    bits: u64,
+    nbits: u32,
+) {
+    if nbits == 0 {
+        return;
+    }
+    if *numall + nbits > 56 {
+        // Pack (bits, nbits) into one u64 instead of a 16-byte tuple:
+        // halves the per-frame scratch buffer under 16-way frame parallelism.
+        chunks.push((*allbits << 6) | u64::from(*numall as u8));
+        *allbits = 0;
+        *numall = 0;
+    }
+    *allbits = (*allbits << nbits) | bits;
+    *numall += nbits;
+}
+
 /// One ANS stream: extra bits then PutSymbol, reverse order, then 32-bit state.
 /// `dist` is the LZ77 distance histogram (cluster `codes.len()`).
 pub fn write_ans_tokens_ex(
@@ -542,32 +589,31 @@ pub fn write_ans_tokens_ex(
             dist.expect("ANS distance cluster")
         }
     };
-    let mut chunks: Vec<(u64, u8)> = Vec::new();
+    let mut chunks: Vec<u64> = Vec::with_capacity(tokens.len() / 3 + 4);
     let mut allbits = 0u64;
     let mut numall = 0u32;
-    let mut addbits = |bits: u64, nbits: u32| {
-        if nbits == 0 {
-            return;
-        }
-        if numall + nbits > 56 {
-            chunks.push((allbits, numall as u8));
-            allbits = 0;
-            numall = 0;
-        }
-        allbits <<= nbits;
-        allbits |= bits;
-        numall += nbits;
-    };
     let mut state = ANS_SIGNATURE << 16;
     for t in tokens.iter().rev() {
-        addbits(t.extra as u64, t.extra_n);
-        let (bits, nbits) = hist(t.cluster).put_symbol(&mut state, t.token);
-        addbits(bits as u64, nbits as u32);
+        push_ans_bits(
+            &mut chunks,
+            &mut allbits,
+            &mut numall,
+            t.extra as u64,
+            u32::from(t.extra_n),
+        );
+        let (bits, nbits) = hist(t.cluster).put_symbol(&mut state, u32::from(t.token));
+        push_ans_bits(
+            &mut chunks,
+            &mut allbits,
+            &mut numall,
+            bits as u64,
+            u32::from(nbits),
+        );
     }
     w.put(32, state as u64);
     w.put(numall, allbits);
-    for (bits, n) in chunks.iter().rev() {
-        w.put(*n as u32, *bits);
+    for c in chunks.iter().rev() {
+        w.put((c & 0x3f) as u32, c >> 6);
     }
 }
 
@@ -589,8 +635,26 @@ pub fn collect_ans_tokens_len(
     min_length: u32,
     out: &mut Vec<AnsToken>,
 ) {
-    let ctxs = vec![cluster; residuals.len()];
-    collect_ans_tokens_ctx_len(residuals, &ctxs, lz77, dist_cluster, min_length, out);
+    // Constant cluster: skip the `vec![cluster; n]` scratch allocation and the
+    // extra pass over every residual that the ctx variant needs.
+    for_each_token_len(residuals, lz77, min_length, |token, extra_n, extra| {
+        out.push(AnsToken {
+            cluster,
+            token: token as u16,
+            extra_n: extra_n as u8,
+            extra,
+        });
+        if lz77 && token >= LZ77_MIN_SYMBOL {
+            if let Some(dc) = dist_cluster {
+                out.push(AnsToken {
+                    cluster: dc,
+                    token: 1,
+                    extra_n: 0,
+                    extra: 0,
+                });
+            }
+        }
+    });
 }
 
 pub fn collect_ans_tokens_ctx(
@@ -634,15 +698,15 @@ pub fn collect_ans_tokens_ctx_len_dist(
         |cluster, token, extra_n, extra| {
             out.push(AnsToken {
                 cluster,
-                token,
-                extra_n,
+                token: token as u16,
+                extra_n: extra_n as u8,
                 extra,
             });
             if lz77 && token >= super::entropy::LZ77_MIN_SYMBOL {
                 if let Some(dc) = dist_cluster {
                     out.push(AnsToken {
                         cluster: dc,
-                        token: dist_token,
+                        token: dist_token as u16,
                         extra_n: 0,
                         extra: 0,
                     });
@@ -681,6 +745,27 @@ pub fn ans_from_residuals(residuals: &[u32], lz77: bool) -> AnsHist {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reciprocal_matches_integer_div() {
+        for f in 1u32..=4096 {
+            let ifreq = ((1u64 << RECIP_PREC) + u64::from(f) - 1) / u64::from(f);
+            let hi = f.saturating_mul(1 << 20).saturating_sub(1);
+            let states = [
+                0u32,
+                1,
+                f - 1,
+                f,
+                f.saturating_add(1),
+                hi,
+                u32::MAX / 3,
+                u32::MAX,
+            ];
+            for state in states {
+                assert_eq!(div_recip(state, f, ifreq), state / f, "f={f} state={state}");
+            }
+        }
+    }
 
     #[test]
     fn unary_hist_roundtrip_state() {
@@ -833,7 +918,7 @@ mod tests {
             .iter()
             .map(|&token| AnsToken {
                 cluster: 0,
-                token,
+                token: token as u16,
                 extra_n: 0,
                 extra: 0,
             })
@@ -861,7 +946,7 @@ mod tests {
             .iter()
             .map(|&token| AnsToken {
                 cluster: 0,
-                token,
+                token: token as u16,
                 extra_n: 0,
                 extra: 0,
             })
@@ -906,8 +991,14 @@ mod tests {
         fn decode_symbol(&self, mut state: u32, br: &mut TestBits<'_>) -> (u32, u32) {
             let idx = state & (ANS_TAB - 1);
             let mut found = None;
-            for (sym, rm) in self.reverse_map.iter().enumerate() {
-                if let Some(off) = rm.iter().position(|&s| u32::from(s) == idx) {
+            for sym in 0..self.freq.len() {
+                let f = self.freq[sym] as usize;
+                if f == 0 {
+                    continue;
+                }
+                let start = self.rev_off[sym] as usize;
+                let row = &self.rev_flat[start..start + f];
+                if let Some(off) = row.iter().position(|&s| u32::from(s) == idx) {
                     found = Some((sym as u32, off as u32, self.freq[sym]));
                     break;
                 }

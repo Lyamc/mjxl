@@ -13,9 +13,12 @@ path = "src/main.rs"
 
 [dependencies]
 bytemuck = { version = "1.19", features = ["derive"] }
+mimalloc = "0.1"
 clap = { version = "4.5", features = ["derive"] }
+clap_complete = "4.5"
 o3-jxl = { path = "third_party/o3-jxl", default-features = false, features = ["parallel"] }
 pollster = "0.4"
+rayon = "1.10"
 thiserror = "2.0"
 # `wgc` pulls wgpu-core. On Windows and Linux that crate enables the Vulkan
 # hal; `dx12` / `metal` are the other native backends. Vulkan Video has no
@@ -30,3 +33,8 @@ wgpu = { version = "24", default-features = false, features = ["metal", "wgsl"] 
 
 [profile.release]
 lto = "thin"
+
+# jxl-oxide rebuilds every default dequant matrix (through DCT256) on each
+# VarDCT frame. The patched crate caches those matrices per process.
+[patch."https://github.com/tirr-c/jxl-oxide.git"]
+jxl-vardct = { path = "third_party/jxl-vardct" }

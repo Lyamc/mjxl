@@ -1,12 +1,34 @@
+# Build artifacts
 target/
+*.pdb
+*.exe
+*.dll
+*.lib
+
+# Cargo lockfile for the vendored path dependency is not authoritative
+third_party/o3-jxl/Cargo.lock
+
+# Test / benchmark media
 *.mjxl
+*.jxl
+*.y4m
 *.avi
 *.mov
 *.mp4
-*.mj2
-*.y4m
+*.mkv
+*.webm
+*.mjp2
 *.ppm
-*.pdb
+*.pgm
+*.pfm
+*.png
 !samples/**
-.DS_Store
 
+# Benchmark scratch directories
+bench-*/
+mjxl-*/
+mjxl-stills-*/
+
+# Editor / OS
+.DS_Store
+*.swp

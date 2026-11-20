@@ -20,6 +20,7 @@ pub enum Coding {
 
 pub struct CompareOpts {
     pub distance: f32,
+    pub effort: u8,
     pub mjpeg_q: i32,
     pub j2k_q: i32,
     pub work_dir: PathBuf,
@@ -161,6 +162,7 @@ fn encode_mjxl(
 ) -> Result<Row> {
     let enc = Encoder::new()
         .distance(opts.distance)
+        .effort(opts.effort)
         .modular(Some(modular));
     let t = Instant::now();
     let coded = temporal::encode_sequence(
@@ -282,7 +284,13 @@ fn encode_cjxl(info: &Info, opts: &CompareOpts, ref_y4m: &Path, _pixels: u64) ->
     for (i, png) in pngs.iter().enumerate() {
         let out = jxl_dir.join(format!("{i:04}.jxl"));
         let st = Command::new("cjxl")
-            .args(["-d", &opts.distance.to_string(), "-e", "7", "--quiet"])
+            .args([
+                "-d",
+                &opts.distance.to_string(),
+                "-e",
+                &opts.effort.to_string(),
+                "--quiet",
+            ])
             .arg(png)
             .arg(&out)
             .stdin(Stdio::null())
@@ -661,7 +669,7 @@ fn median_ms(samples: &[f64]) -> f64 {
     v[v.len() / 2]
 }
 
-fn psnr_rgb8(a: &[u8], b: &[u8]) -> Option<f64> {
+pub fn psnr_rgb8(a: &[u8], b: &[u8]) -> Option<f64> {
     if a.len() != b.len() || a.is_empty() {
         return None;
     }

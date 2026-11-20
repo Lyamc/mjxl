@@ -69,21 +69,35 @@ impl Decoder {
     }
 
     pub fn decode_reader(&self, reader: impl Read) -> Result<Vec<DecodedFrame>> {
+        let mut t = std::time::Instant::now();
         let mut image = JxlImage::builder().read(reader).map_err(Error::ReadJxl)?;
+        profile_ms("jxl-read", &mut t);
         self.decode_image(&mut image)
     }
 
     pub fn decode_image(&self, image: &mut JxlImage) -> Result<Vec<DecodedFrame>> {
+        let mut t = std::time::Instant::now();
         if self.request_srgb {
             apply_srgb(image);
         }
         let renders = render_all_keyframes(image)?;
+        profile_ms("jxl-render", &mut t);
         let w = image.width();
         let h = image.height();
-        Ok(renders
+        let frames = renders
             .iter()
             .map(|r| pack_render(r, self.keep_linear, w, h))
-            .collect())
+            .collect();
+        profile_ms("jxl-pack", &mut t);
+        Ok(frames)
+    }
+}
+
+fn profile_ms(name: &str, t: &mut std::time::Instant) {
+    if std::env::var_os("O3_PROFILE").is_some() {
+        let ms = t.elapsed().as_secs_f64() * 1000.0;
+        eprintln!("profile {name:16} {ms:8.1} ms");
+        *t = std::time::Instant::now();
     }
 }
 

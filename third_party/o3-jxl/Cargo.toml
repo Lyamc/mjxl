@@ -35,3 +35,6 @@ wasm-bindgen = { version = "0.2", optional = true }
 
 [profile.release]
 lto = "thin"
+
+[patch."https://github.com/tirr-c/jxl-oxide.git"]
+jxl-vardct = { path = "../jxl-vardct" }

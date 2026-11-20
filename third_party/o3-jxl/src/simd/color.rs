@@ -108,7 +108,10 @@ pub fn srgb8_rgb_to_xyb_padded(
     };
 
     #[cfg(feature = "parallel")]
-    {
+    // Frame-parallel callers (mjxl's `encode_intra`) already fill the pool.
+    // Splitting each frame's rows again oversubscribes it and makes a 16-frame
+    // clip 1.5-2x slower. Keep the row split only for standalone still encodes.
+    if rayon::current_thread_index().is_none() {
         use rayon::prelude::*;
         let (x_body, _) = x_out.split_at_mut(h * pad_w);
         let (y_body, _) = y_out.split_at_mut(h * pad_w);
@@ -119,6 +122,16 @@ pub fn srgb8_rgb_to_xyb_padded(
             .zip(b_body.par_chunks_mut(pad_w))
             .enumerate()
             .for_each(|(row, ((xr, yr), br))| fill(row, xr, yr, br));
+    } else {
+        for row in 0..h {
+            let d = row * pad_w;
+            fill(
+                row,
+                &mut x_out[d..d + pad_w],
+                &mut y_out[d..d + pad_w],
+                &mut b_out[d..d + pad_w],
+            );
+        }
     }
     #[cfg(not(feature = "parallel"))]
     {

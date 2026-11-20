@@ -1,0 +1,39 @@
+[package]
+name = "jxl-vardct"
+description = "JPEG XL VarDCT frame representation from jxl-oxide (c0cc4c7), with default dequant matrices cached per process"
+authors = ["Wonwoo Choi <chwo9843@gmail.com>"]
+repository = "https://github.com/tirr-c/jxl-oxide.git"
+license = "MIT OR Apache-2.0"
+version = "0.11.1"
+edition = "2024"
+
+# Snapshot of jxl-oxide crates/jxl-vardct at c0cc4c7ea57c1207f38ff2970d94757470613be4.
+# The only local change is DequantMatrixSet::parse: the all-default bit no longer
+# rebuilds DCT8..DCT256 on every frame. Each default matrix is built on first use.
+
+[dependencies]
+tracing = { version = "0.1.40", default-features = false, features = ["std"] }
+
+[dependencies.jxl-bitstream]
+version = "1.0.0"
+git = "https://github.com/tirr-c/jxl-oxide.git"
+
+[dependencies.jxl-coding]
+version = "1.0.0"
+git = "https://github.com/tirr-c/jxl-oxide.git"
+
+[dependencies.jxl-grid]
+version = "0.6.0"
+git = "https://github.com/tirr-c/jxl-oxide.git"
+
+[dependencies.jxl-modular]
+version = "0.11.2"
+git = "https://github.com/tirr-c/jxl-oxide.git"
+
+[dependencies.jxl-oxide-common]
+version = "1.0.0"
+git = "https://github.com/tirr-c/jxl-oxide.git"
+
+[dependencies.jxl-threadpool]
+version = "1.0.0"
+git = "https://github.com/tirr-c/jxl-oxide.git"

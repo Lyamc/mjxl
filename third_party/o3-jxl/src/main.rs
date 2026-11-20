@@ -75,8 +75,8 @@ enum Commands {
         /// Butteraugli distance. 0 = lossless. Default 0 (unlike cjxl's 1.0).
         #[arg(short = 'd', long)]
         distance: Option<f32>,
-        /// Effort 1..=10 (default 7). Higher = smaller groups / LZ77.
-        #[arg(short = 'e', long, default_value_t = 7)]
+        /// Effort 1..=10 (default 2). 1 is fastest; 7..=10 are the full VarDCT path.
+        #[arg(short = 'e', long, default_value_t = o3_jxl::DEFAULT_EFFORT)]
         effort: u8,
         /// Smaller groups for progressive / truncated decode.
         #[arg(short = 'p', long)]
