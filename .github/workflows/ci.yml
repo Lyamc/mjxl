@@ -25,11 +25,8 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
-      - name: Build
-        run: cargo build --release
+      - name: Build workspace (mjxl + o3-jxl + jxl-vardct)
+        run: cargo build --workspace --release
 
-      - name: Test mjxl
-        run: cargo test --release
-
-      - name: Test vendored o3-jxl
-        run: cargo test --release --manifest-path third_party/o3-jxl/Cargo.toml
+      - name: Test workspace
+        run: cargo test --workspace --release

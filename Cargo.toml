@@ -1,3 +1,7 @@
+[workspace]
+members = [".", "third_party/o3-jxl", "third_party/jxl-vardct"]
+resolver = "2"
+
 [package]
 name = "mjxl"
 version = "0.1.0"

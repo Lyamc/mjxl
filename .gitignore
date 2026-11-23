@@ -23,7 +23,7 @@ third_party/o3-jxl/Cargo.lock
 *.pgm
 *.pfm
 *.png
-!samples/**
+!**/samples/**
 
 # Benchmark scratch directories
 bench-*/

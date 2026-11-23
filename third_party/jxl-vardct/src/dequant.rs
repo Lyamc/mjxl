@@ -581,8 +581,8 @@ impl BundleDefault<TransformType> for DequantMatrixParams {
 /// (through DCT256) is tens of milliseconds, and a VarDCT frame only asks for
 /// the transforms it actually uses. Each matrix is computed once per process.
 fn default_matrix_pair(idx: usize) -> &'static ([Vec<f32>; 3], [Vec<f32>; 3]) {
-    use std::sync::OnceLock;
     use TransformType::*;
+    use std::sync::OnceLock;
 
     const LIST: [TransformType; 17] = [
         Dct8, Hornuss, Dct2, Dct4, Dct16, Dct32, Dct8x16, Dct8x32, Dct16x32, Dct4x8, Afv0, Dct64,

@@ -281,9 +281,13 @@ compatible — it depends on clap, wgpu, rayon, filesystem and sockets.
 
 ## Development
 
-Layout: `src/` is the mjxl CLI and container/temporal/GPU layers;
-`third_party/o3-jxl/` is the vendored still codec (modular + VarDCT);
-`third_party/jxl-vardct/` is a local patch of jxl-oxide's dequant cache;
+This repo is a **single Cargo workspace** containing three crates — `mjxl`
+(CLI, container, temporal, GPU), `third_party/o3-jxl` (the still codec),
+and `third_party/jxl-vardct` (a small patch of jxl-oxide's dequant cache).
+There is one `Cargo.lock`, one build graph and one test command. The separate
+`C:\Build\codecs\o3-jxl` checkout is an older snapshot and is superseded by
+`third_party/o3-jxl` here.
+
 `tools/` holds the MJPEG player / desktop-stream helper; `DESIGN.md` explains
 the container investigation and `PERF.md` records measured results and the
 experiments that were rejected.
@@ -292,9 +296,8 @@ Formatting and tests are checked in CI on Windows, Linux and macOS:
 
 ```bash
 cargo fmt --all -- --check
-cargo build --release
-cargo test --release
-cargo test --release --manifest-path third_party/o3-jxl/Cargo.toml
+cargo build --workspace --release
+cargo test --workspace --release
 ```
 
 The pinned nightly in `rust-toolchain.toml` is required for `portable_simd`.
