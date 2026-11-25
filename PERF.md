@@ -267,6 +267,22 @@ PSNR matches within 0.1 dB on all three; bpp is 9 % (photo) and 15–16 %
 (bike, kodim23) above libjxl. DCT8-only helped bike/kodim ~1–3 % at matched
 PSNR but hurt photo, so it was not made a default.
 
+Multi-frame unchanged frames (verified for both coders): `src/temporal.rs`
+skip / dirty-rect logic is codec-agnostic — it calls the same `Encoder::encode`
+for modular and VarDCT crops. 7×512×384 clip, d=1/e=7:
+
+| clip | coder | mode | time | payload | bpp |
+|---|---|---|---|---|---|
+| all frames identical | vardct | normal (skip=6) | 15.9 ms | 9,145 B | 0.053 |
+| all frames identical | vardct | `--intra` | 28.7 ms | 64,015 B | 0.372 |
+| all frames identical | modular | normal (skip=6) | 7.0 ms | 9,956 B | 0.058 |
+| one 128×128 dirty block | vardct | normal (skip=5, rect=1) | 27.5 ms | 20,902 B | 0.122 |
+| one 128×128 dirty block | vardct | `--intra` | 28.1 ms | 123,811 B | 0.720 |
+
+So VarDCT gets the same unchanged-frame win (1.8× faster, 7× smaller for a
+static clip); dirty-rect mainly saves bits, since the rect still has to be
+encoded at VarDCT effort 7.
+
 Performance of the 16-kind change (measured with `mjxl bench -m vardct -e 7`,
 Y4M input, median of 15): the naive `greedy_cluster` recomputed every pair
 cost on every merge, so 255 raw contexts cost 2.5× encode time. Caching the
