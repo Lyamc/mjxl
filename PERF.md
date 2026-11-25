@@ -211,6 +211,10 @@ libjxl within 0.05 dB on all three test images:
 Rate is still 13–23 % above libjxl at this point; the earlier 0.403 bpp @
 44.87 dB setting is more rate-efficient but further from libjxl's PSNR.
 
+Num-nonzero context scaling (tested, reverted): scaling the nnz context table
+had no rate effect at ≥1.0 and crashed below 1.0 (context id past the
+decoder's fixed 495-table). No rate win.
+
 Coefficient-context split (kept): the two ANS clusters for coefficient
 contexts split at raw context 80; 120 is smaller on all three test images at
 unchanged PSNR (photo 0.470→0.468, bike 2.834→2.813, kodim23 1.584→1.565).
