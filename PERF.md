@@ -211,6 +211,10 @@ libjxl within 0.05 dB on all three test images:
 Rate is still 13–23 % above libjxl at this point; the earlier 0.403 bpp @
 44.87 dB setting is more rate-efficient but further from libjxl's PSNR.
 
+qf-threshold segment count (tested, reverted): 1–4 segments produced
+bitrate differences <0.2% with no PSNR change; the default 2 remains best
+on balance.
+
 Coordinated nnz-context implementation (attempted, reverted): I replicated
 the decoder's 37-way neighbour prediction in `hf_group_stream` with
 per-column nnz grids (current/previous row) and wired a split ANS cluster map.
