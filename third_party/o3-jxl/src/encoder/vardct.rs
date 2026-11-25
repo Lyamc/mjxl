@@ -3216,7 +3216,9 @@ const COEFF_NUM_NONZERO_CONTEXT: [u32; 63] = [
     206, 206, 206, 206,
 ];
 
-const HF_COEFF_SPLIT: usize = 80;
+/// Split point between the two ANS clusters for coefficient contexts.
+/// 120 measured smaller than 80 on photo / bike / kodim23 at unchanged PSNR.
+const HF_COEFF_SPLIT: usize = 120;
 
 fn raw_hf_ctx(bc: u8, kind: u8) -> usize {
     bc as usize * 3 + kind as usize

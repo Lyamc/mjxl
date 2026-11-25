@@ -211,6 +211,11 @@ libjxl within 0.05 dB on all three test images:
 Rate is still 13–23 % above libjxl at this point; the earlier 0.403 bpp @
 44.87 dB setting is more rate-efficient but further from libjxl's PSNR.
 
+Coefficient-context split (kept): the two ANS clusters for coefficient
+contexts split at raw context 80; 120 is smaller on all three test images at
+unchanged PSNR (photo 0.470→0.468, bike 2.834→2.813, kodim23 1.584→1.565).
+Swept 40–160; 110–120 was the sweet spot. `djxl` decodes the bitstream.
+
 ANS shift selection (kept): `AnsHist::general` chose the histogram precision
 shift by data cost alone, ignoring that higher shifts write extra precision
 bits per symbol in the header. Adding a 5-bit-per-symbol penalty is ~0.2 %
