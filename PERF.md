@@ -243,6 +243,19 @@ Num-nonzero context scaling (tested, reverted): scaling the nnz context table
 had no rate effect at ≥1.0 and crashed below 1.0 (context id past the
 decoder's fixed 495-table). No rate win.
 
+Matched-PSNR R-D check (d=1.05, median of 5): at d=1 our PSNR is above
+libjxl's, so a fair comparison adjusts distance to equal PSNR:
+
+| d=1.05 | mjxl | libjxl | PSNR delta |
+|---|---|---|---|
+| photo | 0.437 bpp @ 46.45 | 0.400 @ 46.47 | −0.02 dB |
+| bike | 2.603 @ 38.31 | 2.235 @ 38.30 | +0.01 dB |
+| kodim23 | 1.442 @ 40.51 | 1.249 @ 40.43 | +0.08 dB |
+
+PSNR matches within 0.1 dB on all three; bpp is 9 % (photo) and 15–16 %
+(bike, kodim23) above libjxl. DCT8-only helped bike/kodim ~1–3 % at matched
+PSNR but hurt photo, so it was not made a default.
+
 sqrt coefficient-kind buckets (kept): mapping the raw coefficient context
 through sqrt before splitting into 16 kinds gives slightly finer
 discrimination where most tokens live; ~0.1% smaller on all three images at
