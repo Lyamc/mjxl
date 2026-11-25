@@ -211,6 +211,15 @@ libjxl within 0.05 dB on all three test images:
 Rate is still 13–23 % above libjxl at this point; the earlier 0.403 bpp @
 44.87 dB setting is more rate-efficient but further from libjxl's PSNR.
 
+Decoder-style nnz prediction contexts (tested, reverted): the jxl-oxide
+decoder selects one of 37 nnz contexts per block from a neighbour prediction;
+our encoder collapsed all 37 to one ANS cluster. I wired full prediction into
+`hf_group_stream` with per-column nnz grids. It produced valid streams with
+one cluster (bit-identical), but splitting into 2+ clusters broke decoding on
+multi-group images (`too many zeros in varblock HF coefficient`) because the
+decoder's nnz grid carries state across group boundaries that must be
+replicated exactly. Reverted; requires coordinated decoder changes.
+
 Alternative ANS context splits (tested, reverted): splitting the two
 coefficient clusters by `prev_nz` or frequency band instead of the tuned raw
 context threshold 120 was image-dependent — `nz` helped bike/kodim ~1% but
