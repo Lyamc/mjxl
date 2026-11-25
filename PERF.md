@@ -211,6 +211,13 @@ libjxl within 0.05 dB on all three test images:
 Rate is still 13–23 % above libjxl at this point; the earlier 0.403 bpp @
 44.87 dB setting is more rate-efficient but further from libjxl's PSNR.
 
+Rate-reduction knobs tested at matched PSNR (all reverted): DC scale 1.6–2.5
+raised both rate and PSNR on photo and did not help bike/kodim; refiner
+iterations 1/3 were no better than 2; quant-matrix scales (X/Y/B 0.6–1.2) and
+disabling coefficient orders, block-context, CFL, DCT4/16/32 produced no
+consistent rate reduction at matched PSNR. The remaining rate gap is in the
+entropy coder / coefficient context model, not the quant knobs.
+
 **Masking-aware quant feedback (kept).** A DCT-domain feedback pass at effort
 5+ computes per-block quantisation error normalised by local signal energy
 (energy normalisation = a crude masking model: busy blocks with large raw
