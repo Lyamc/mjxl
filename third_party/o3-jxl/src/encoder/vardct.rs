@@ -650,7 +650,7 @@ pub fn encode_vardct_rgb(
         encode_pass_tokens(
             &mut w,
             &hf_tokens[0].values,
-            &hf_tokens[0].ctxs,
+            &hf_tokens[0].clusters,
             &hf_hists,
             None,
         );
@@ -674,7 +674,7 @@ pub fn encode_vardct_rgb(
         let pass_sections = encode_sections(num_groups, |g| {
             let mut w = BitWriter::with_capacity(blocks_per_group * 96 + 256);
             let tok = &hf_tokens[g as usize];
-            encode_pass_tokens(&mut w, &tok.values, &tok.ctxs, &hf_hists, None);
+            encode_pass_tokens(&mut w, &tok.values, &tok.clusters, &hf_hists, None);
             w.finish()
         });
         sections.extend(pass_sections);
@@ -3220,6 +3220,8 @@ const COEFF_NUM_NONZERO_CONTEXT: [u32; 63] = [
 /// cluster for the nnz token). The decoder reads an arbitrary cluster map for
 /// these contexts, so finer grouping is format-compatible. 16 measured
 /// 3–5 % smaller than 2 at unchanged PSNR; higher values regress or overflow.
+/// 16 kinds (1 nnz + 16 coefficient) measured the best rate/speed balance.
+/// Paired with u16 raw context ids so higher values remain possible.
 const COEFF_KINDS: usize = 16;
 
 fn coeff_kind(ctx: usize) -> u8 {
@@ -3287,7 +3289,10 @@ fn greedy_cluster(freqs: &[Vec<u64>], max_clusters: usize) -> (Vec<Vec<u64>>, Ve
     const HEADER: f64 = 80.0;
     let mut scratch: Vec<u64> = Vec::new();
     while active.len() > max_clusters {
-        let bits: Vec<f64> = active.iter().map(|&i| hist_shannon_bits(&merged[i])).collect();
+        let bits: Vec<f64> = active
+            .iter()
+            .map(|&i| hist_shannon_bits(&merged[i]))
+            .collect();
         let mut best = f64::INFINITY;
         let mut pair = (0usize, 1usize);
         for i in 0..active.len() {
@@ -3790,7 +3795,10 @@ fn encode_coeff_orders(w: &mut BitWriter, orders: &CoeffOrders) {
 /// [`remap_hf_ctx`] applies the clustered histogram map.
 struct HfGroupTokens {
     values: Vec<u32>,
-    ctxs: Vec<u8>,
+    /// Raw (block-cluster, kind) ids before clustering; u16 allows >255.
+    ctxs: Vec<u16>,
+    /// Final ANS cluster ids after [`remap_hf_ctx`].
+    clusters: Vec<u8>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3812,34 +3820,33 @@ fn hf_pass_tokens(
 ) -> Vec<HfGroupTokens> {
     let num_groups = width.div_ceil(GROUP_DIM) * height.div_ceil(GROUP_DIM);
     let n_raw = bcm.n_clusters as usize * (COEFF_KINDS + 1);
-    let identity: Vec<u8> = (0..n_raw as u8).collect();
+    let identity: Vec<u16> = (0..n_raw as u16).collect();
     map_indexed(num_groups, |g| {
         let (values, ctxs) = hf_group_stream(
             width, height, bw, g, ac_q, acs, ac16, ac16_at, ac32, ac32_at, ac168, ac168_at,
             &identity, orders, hf_muls, bcm,
         );
-        HfGroupTokens { values, ctxs }
+        HfGroupTokens {
+            values,
+            ctxs,
+            clusters: Vec::new(),
+        }
     })
 }
 
 fn hf_token_freqs(tok: &HfGroupTokens, n_raw: usize) -> Vec<Vec<u64>> {
     let mut freqs = vec![vec![0u64; 32]; n_raw];
-    super::entropy::for_each_token_ctx_len(
-        &tok.values,
-        &tok.ctxs,
-        false,
-        LZ77_MIN_LENGTH,
-        |cluster, token, _, _| {
-            let i = cluster as usize;
-            if i < freqs.len() {
-                let t = token as usize;
-                if t >= freqs[i].len() {
-                    freqs[i].resize(t + 1, 0);
-                }
-                freqs[i][t] += 1;
+    for (&v, &ctx) in tok.values.iter().zip(&tok.ctxs) {
+        let i = ctx as usize;
+        if i < freqs.len() {
+            let (t, _, _) = hybrid_uint_400(v);
+            let t = t as usize;
+            if t >= freqs[i].len() {
+                freqs[i].resize(t + 1, 0);
             }
-        },
-    );
+            freqs[i][t] += 1;
+        }
+    }
     for f in &mut freqs {
         while f.len() > 1 && f.last() == Some(&0) {
             f.pop();
@@ -3877,9 +3884,7 @@ fn hist_from_hf_tokens(
 /// building the stream a second time with `assign` instead of identity.
 fn remap_hf_ctx(tokens: &mut [HfGroupTokens], assign: &[u8]) {
     let apply = |tok: &mut HfGroupTokens| {
-        for c in &mut tok.ctxs {
-            *c = assign[*c as usize];
-        }
+        tok.clusters = tok.ctxs.iter().map(|&c| assign[c as usize]).collect();
     };
     #[cfg(feature = "parallel")]
     {
@@ -4131,11 +4136,11 @@ fn hf_group_stream(
     ac32_at: &[u32],
     ac168: &[Vec<i32>; 3],
     ac168_at: &[u32],
-    assign: &[u8],
+    assign: &[u16],
     orders: &CoeffOrders,
     hf_muls: &[i32],
     bcm: &BlockCtxModel,
-) -> (Vec<u32>, Vec<u8>) {
+) -> (Vec<u32>, Vec<u16>) {
     let gpr = width.div_ceil(GROUP_DIM).max(1);
     let gx = g % gpr;
     let gy = g / gpr;
@@ -4149,7 +4154,7 @@ fn hf_group_stream(
     // DCT32 AC is 1008 coefficients. One buffer covers every block in the group.
     let mut scratch: Vec<i32> = Vec::with_capacity(1008);
     let mut push = |values: &mut Vec<u32>,
-                    ctxs: &mut Vec<u8>,
+                    ctxs: &mut Vec<u16>,
                     acs_id: u8,
                     oid: usize,
                     c: usize,
@@ -4157,10 +4162,10 @@ fn hf_group_stream(
                     hf_mul: i32| {
         let perm = &orders.perm[oid][c];
         if perm.is_empty() {
-            hf_push_slice(values, ctxs, acs_id, c, slice, assign, hf_mul, bcm);
+            hf_push_slice(values, ctxs, acs_id, c, slice, hf_mul, bcm);
         } else {
             reorder_ac_into(slice, perm, order_llf(oid), &mut scratch);
-            hf_push_slice(values, ctxs, acs_id, c, &scratch, assign, hf_mul, bcm);
+            hf_push_slice(values, ctxs, acs_id, c, &scratch, hf_mul, bcm);
         }
     };
     for by in y0..y0 + gh {
@@ -4245,18 +4250,17 @@ fn hf_group_stream(
 #[allow(clippy::too_many_arguments)]
 fn hf_push_slice(
     values: &mut Vec<u32>,
-    ctxs: &mut Vec<u8>,
+    ctxs: &mut Vec<u16>,
     acs: u8,
     c: usize,
     slice: &[i32],
-    assign: &[u8],
     hf_mul: i32,
     bcm: &BlockCtxModel,
 ) {
     let nnz = count_nonzero(slice);
     let bc = block_ctx(acs, c, hf_mul, bcm);
     values.push(nnz);
-    ctxs.push(assign[raw_hf_ctx(bc, 0)]);
+    ctxs.push(raw_hf_ctx(bc, 0) as u16);
     if nnz == 0 {
         return;
     }
@@ -4270,7 +4274,7 @@ fn hf_push_slice(
         let ctx = hf_coeff_ctx(left, scan, prev, nblog);
         let kind = coeff_kind(ctx);
         values.push(pack_signed(v));
-        ctxs.push(assign[raw_hf_ctx(bc, kind)]);
+        ctxs.push(raw_hf_ctx(bc, kind) as u16);
         prev = v != 0;
         if prev {
             left -= 1;
