@@ -211,6 +211,11 @@ libjxl within 0.05 dB on all three test images:
 Rate is still 13–23 % above libjxl at this point; the earlier 0.403 bpp @
 44.87 dB setting is more rate-efficient but further from libjxl's PSNR.
 
+ANS shift selection (kept): `AnsHist::general` chose the histogram precision
+shift by data cost alone, ignoring that higher shifts write extra precision
+bits per symbol in the header. Adding a 5-bit-per-symbol penalty is ~0.2 %
+smaller at unchanged PSNR (photo 0.471→0.470, kodim23 1.586→1.584).
+
 LF prefix-code smoothing (tested, no effect): removing the same +1 heuristic
 from `finish_code` (the LF/DC prefix code) changed no byte counts on any test
 image; coefficient orders are already learned from zero counts. Reverted.

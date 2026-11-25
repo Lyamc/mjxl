@@ -97,7 +97,12 @@ impl AnsHist {
         let mut best: Option<(f64, Vec<u16>, u8)> = None;
         for shift in [0u8, 6, 12] {
             if let Some(counts) = quantize_counts(freqs, u32::from(shift)) {
-                let cost = ans_data_cost(freqs, &counts);
+                let mut cost = ans_data_cost(freqs, &counts);
+                // Higher shifts carry extra precision bits per symbol in the
+                // histogram header; include that cost in the choice.
+                if shift > 0 {
+                    cost += 5.0 * freqs.iter().filter(|&&f| f > 0).count() as f64;
+                }
                 if best.as_ref().is_none_or(|(c, _, _)| cost < *c) {
                     best = Some((cost, counts, shift));
                 }
