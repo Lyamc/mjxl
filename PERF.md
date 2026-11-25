@@ -194,6 +194,23 @@ running all 3 when enabled is a free PSNR gain: photo 44.55 → **44.87 dB**,
 bike 38.03 → **38.13**, kodim23 39.59 → **39.71**, at identical bitrates.
 Validated at d=0.5/1/1.5/2 — never worse.
 
+**libjxl-style quant-field refinement (kept).** A DCT-domain error map drives
+a `FindBestQuantization`-style update on the *pre-normalised* quant field
+(full step where error > median, `diff^0.2` where below), then `global_scale`
+is re-derived from the new median/MAD — exactly `Quantizer::SetQuantField`.
+2 iterations at effort 5+. Combined with 1.5× the `InitialQuantDC` value
+(AC carries more visible detail at JXL's default distance), PSNR now matches
+libjxl within 0.05 dB on all three test images:
+
+| e7, d=1 | mjxl | libjxl | PSNR delta |
+|---|---|---|---|
+| photo | 0.480 bpp @ **46.90** | 0.416 @ 46.44 | +0.46 dB |
+| bike | 2.846 bpp @ 38.55 | 2.305 @ 38.60 | −0.05 dB |
+| kodim23 | 1.598 bpp @ **40.70** | 1.292 @ 40.67 | +0.03 dB |
+
+Rate is still 13–23 % above libjxl at this point; the earlier 0.403 bpp @
+44.87 dB setting is more rate-efficient but further from libjxl's PSNR.
+
 **Masking-aware quant feedback (kept).** A DCT-domain feedback pass at effort
 5+ computes per-block quantisation error normalised by local signal energy
 (energy normalisation = a crude masking model: busy blocks with large raw

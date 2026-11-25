@@ -261,7 +261,13 @@ pub fn encode_vardct_rgb(
     // libjxl derives `global_scale` from the actual AQ field median and its
     // median absolute deviation. A fixed `0.39/d` over/under-quantises on
     // images whose masking field differs from the nominal value.
-    let quant_dc = initial_quant_dc(distance);
+    // Slightly coarser DC than InitialQuantDC: AC coefficients carry more
+    // visible detail at JXL's default distance, and spending fewer bits on DC
+    // improves PSNR at fixed rate on photographic content.
+    // Slightly coarser DC than InitialQuantDC: at JXL's default distance AC
+    // carries more visible detail, and spending fewer bits on DC improves
+    // PSNR at fixed rate on photographic content.
+    let quant_dc = initial_quant_dc(distance) * 1.5;
     let mut aq_field: Option<Vec<f32>> = None;
     let (global_scale, quant_lf, base_hf_mul) = if tools.adaptive_quant {
         let iqf_d = if tools.gaborish {
@@ -279,11 +285,11 @@ pub fn encode_vardct_rgb(
     };
     // The full-frame 1×1 mask is only read by block-size search and adaptive quant.
     let block_search = tools.dct4 || ((tools.dct16 || tools.dct32) && !no_varblock);
-    let (mut hf_muls, mask1x1) = if let Some(qf) = aq_field {
+    let (mut hf_muls, mask1x1) = if let Some(ref qf) = aq_field {
         let inv_gs = 65536.0 / global_scale as f32;
         let hf: Vec<i32> = qf
-            .into_iter()
-            .map(|q| (q * inv_gs + 0.5).clamp(1.0, 256.0) as i32)
+            .iter()
+            .map(|&q| (q * inv_gs + 0.5).clamp(1.0, 256.0) as i32)
             .collect();
         (hf, vec![1.0f32; pw * ph])
     } else if block_search {
@@ -353,10 +359,20 @@ pub fn encode_vardct_rgb(
     );
     tick("dct-quant", &mut t_mark);
 
-    if tools.adaptive_quant {
-        // One masking-normalised error pass; sum(1/hf) conservation keeps the
-        // bitrate roughly constant while moving bits to under-served blocks.
-        for _ in 0..1 {
+    let fb_iters = 2usize;
+    if let Some(ref mut qf) = aq_field
+        && fb_iters > 0
+    {
+        let mut qmin = qf.iter().copied().fold(f32::INFINITY, f32::min);
+        let mut qmax = qf.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        if qmin <= 0.0 {
+            qmin = 1e-3;
+        }
+        let ratio = (qmax / qmin).max(1.0);
+        let dev = (250.0f32 / ratio).sqrt().min(2.0);
+        let qlo = qmin / (2.0 * dev);
+        let qhi = qmax * (dev / 2.0);
+        for _ in 0..fb_iters {
             let errors = quant_error_by_block(
                 bw,
                 bh,
@@ -369,7 +385,14 @@ pub fn encode_vardct_rgb(
                 QUANT_BIAS_NUM,
                 &cfl,
             );
-            refine_quant_field(&mut hf_muls, &errors);
+            refine_qf(qf, &errors, qlo, qhi);
+            let (med, mad) = median_and_mad(qf);
+            let (gs2, qlf2, _) = compute_global_scale_and_quant(quant_dc, med, mad);
+            let ig2 = 65536.0 / gs2 as f32;
+            for (hf, &q) in hf_muls.iter_mut().zip(qf.iter()) {
+                *hf = (q * ig2 + 0.5).clamp(1.0, 256.0) as i32;
+            }
+            let _ = qlf2;
             dct_quant_all(
                 bw,
                 bh,
@@ -1577,39 +1600,22 @@ fn quant_error_by_block(
 /// One feedback iteration: shift quant toward blocks with high perceptual
 /// (masking-normalised) error, then conserve the *rate proxy* sum(1/hf) —
 /// entropy grows roughly with the count of nonzero coefficients, i.e. 1/hf.
-fn refine_quant_field(hf_muls: &mut [i32], errors: &[f32]) {
-    const EXP: f64 = 0.0625;
-    if hf_muls.len() < 4 || errors.len() != hf_muls.len() {
+/// libjxl `FindBestQuantization` update on the *pre-normalised* quant field.
+/// After modifying qf, the caller re-derives global_scale from its median/MAD
+/// (Quantizer::SetQuantField), which keeps the raw hf field and bitrate stable.
+fn refine_qf(qf: &mut [f32], errors: &[f32], min: f32, max: f32) {
+    const EXP: f64 = 0.2;
+    if qf.len() < 4 || errors.len() != qf.len() {
         return;
     }
     let mut sorted = errors.to_vec();
     let mid = sorted.len() / 2;
     sorted.select_nth_unstable_by(mid, |a, b| a.total_cmp(b));
-    let median = sorted[mid].max(1e-6);
-    for (hf, &e) in hf_muls.iter_mut().zip(errors) {
-        let factor = ((e / median).max(0.25).min(4.0) as f64).powf(EXP);
-        *hf = ((*hf as f64) * factor).round().clamp(1.0, 256.0) as i32;
-    }
-    // Entropy grows with the count of nonzero coefficients, i.e. with 1/hf.
-    // Conserve sum(1/hf) so reallocation does not simply spend more bits.
-    let old: f64 = hf_muls.iter().map(|&v| 1.0 / v as f64).sum();
-    let mut lo = 0.25f64;
-    let mut hi = 4.0f64;
-    for _ in 0..16 {
-        let mid = (lo + hi) * 0.5;
-        let now: f64 = hf_muls
-            .iter()
-            .map(|&v| 1.0 / ((v as f64 * mid).round() as i32).clamp(1, 256) as f64)
-            .sum();
-        if now > old {
-            lo = mid;
-        } else {
-            hi = mid;
-        }
-    }
-    let scale = (lo + hi) * 0.5;
-    for hf in hf_muls.iter_mut() {
-        *hf = ((*hf as f64 * scale).round() as i32).clamp(1, 256);
+    let target = sorted[mid].max(1e-6);
+    for (q, &e) in qf.iter_mut().zip(errors) {
+        let diff = ((e / target) as f64).max(0.25).min(4.0);
+        let factor = if diff <= 1.0 { diff.powf(EXP) } else { diff };
+        *q = ((*q as f64) * factor).clamp(min as f64, max as f64) as f32;
     }
 }
 
