@@ -243,6 +243,17 @@ Num-nonzero context scaling (tested, reverted): scaling the nnz context table
 had no rate effect at ≥1.0 and crashed below 1.0 (context id past the
 decoder's fixed 495-table). No rate win.
 
+Multiple HF presets (implemented, reverted): the bitstream supports N HF
+ANS presets with a per-group preset bit and per-preset cluster maps. I wired
+2/4/8 presets with per-group assignment from nonzero-token density and from
+mean hf_mul. The format worked (decoder read the right preset ids and map
+lengths), but doubling the histogram header always cost more than the
+per-region model saved: photo 0.453→0.459/0.472/0.500 bpp, bike
+2.675→2.678/2.686/2.701, kodim23 1.491→1.502/1.526/1.549, PSNR unchanged.
+Single preset retained. An off-by-one in preset-bit width
+(`(N-1).next_power_of_two()` instead of `N.next_power_of_two()`) was found
+and fixed during this experiment (irrelevant after revert).
+
 Matched-PSNR R-D check (d=1.05, median of 5): at d=1 our PSNR is above
 libjxl's, so a fair comparison adjusts distance to equal PSNR:
 
