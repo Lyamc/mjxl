@@ -190,6 +190,23 @@ libjxl remains ahead (0.416 bpp @ 46.44 dB on the photo) — its remaining
 advantage is the iterative butteraugli-driven quant refinement, which this
 encoder does not implement.
 
+**Iterative quant feedback (tested, reverted).** I implemented a DCT-domain
+quantisation-error feedback loop at effort 5+: compute per-block coefficient
+MSE (proportional to spatial MSE for the orthonormal DCT), shift hf_muls toward
+high-error blocks, and renormalise. Variants tried: raw vs energy-normalised
+error, 1–2 iterations, exponents 0.0625–0.25, sum vs zero-count rate
+conservation. None improved RD consistently:
+
+| variant (e7) | photo | bike | kodim23 |
+|---|---|---|---|
+| no feedback | 0.455 @ 44.70 | 2.703 @ 37.95 | 1.502 @ 40.16 |
+| 2× exp=0.125, raw error | 0.471 @ 44.76 | 2.745 @ 38.38 | 1.678 @ 41.01 |
+| 2× exp=0.125, normalised | 0.471 @ 44.76 | 2.868 @ 38.84 | 1.659 @ 40.67 |
+
+Every variant spent 3–20 % more bits for 0.06–0.9 dB — worse RD on the photo
+and kodim23, where libjxl's butteraugli feedback (not a raw MSE feedback) is
+what actually closes the gap. The code and its env knobs were removed.
+
 ### Native JXL animation with patches (encoder support added)
 `encoder/header.rs` now writes `FrameFlags::PATCHES`, `save_as_reference`, and
 `save_before_ct`; `encoder/mod.rs` writes the `Patches` ANS structure at the
