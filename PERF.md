@@ -243,6 +243,16 @@ Num-nonzero context scaling (tested, reverted): scaling the nnz context table
 had no rate effect at ≥1.0 and crashed below 1.0 (context id past the
 decoder's fixed 495-table). No rate win.
 
+16 per-coefficient ANS clusters (kept): the decoder reads an arbitrary
+cluster map for all 458 coefficient contexts, so the encoder can group them
+finer than the old 2-cluster split. 16 kinds (1 nnz + 16 coefficient) is
+format-compatible and measured at unchanged PSNR: photo 0.468→0.453 bpp,
+bike 2.813→2.677, kodim23 1.565→1.492. 32–48 kinds helped photo/kodim a bit
+more but crashed on bike (cluster-map overflow); 16 is the safe universal
+setting. `greedy_cluster` was also optimised (cached entropies, reused
+scratch) to recover about half of the extra encode time. `djxl` decodes the
+streams.
+
 Coefficient-context split (kept): the two ANS clusters for coefficient
 contexts split at raw context 80; 120 is smaller on all three test images at
 unchanged PSNR (photo 0.470→0.468, bike 2.834→2.813, kodim23 1.584→1.565).

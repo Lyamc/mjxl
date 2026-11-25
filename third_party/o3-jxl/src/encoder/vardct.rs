@@ -3216,12 +3216,18 @@ const COEFF_NUM_NONZERO_CONTEXT: [u32; 63] = [
     206, 206, 206, 206,
 ];
 
-/// Split point between the two ANS clusters for coefficient contexts.
-/// 120 measured smaller than 80 on photo / bike / kodim23 at unchanged PSNR.
-const HF_COEFF_SPLIT: usize = 120;
+/// Number of ANS clusters for the 458 per-coefficient contexts (plus one
+/// cluster for the nnz token). The decoder reads an arbitrary cluster map for
+/// these contexts, so finer grouping is format-compatible. 16 measured
+/// 3–5 % smaller than 2 at unchanged PSNR; higher values regress or overflow.
+const COEFF_KINDS: usize = 16;
+
+fn coeff_kind(ctx: usize) -> u8 {
+    1 + ((ctx * COEFF_KINDS) / 458) as u8
+}
 
 fn raw_hf_ctx(bc: u8, kind: u8) -> usize {
-    bc as usize * 3 + kind as usize
+    bc as usize * (COEFF_KINDS + 1) + kind as usize
 }
 
 /// Decoder map: 37×N nnz contexts then N×458 coeff contexts.
@@ -3236,7 +3242,7 @@ fn hf_cluster_map(assign: &[u8], n_bc: usize) -> Vec<u8> {
     for bc in 0..n_bc {
         let base = bc * 458 + 37 * n_bc;
         for i in 0..458 {
-            let kind = 1 + u8::from(i >= HF_COEFF_SPLIT);
+            let kind = coeff_kind(i);
             m[base + i] = assign[raw_hf_ctx(bc as u8, kind)];
         }
     }
@@ -3279,17 +3285,17 @@ fn greedy_cluster(freqs: &[Vec<u64>], max_clusters: usize) -> (Vec<Vec<u64>>, Ve
         return (vec![vec![1u64]], vec![0u8; n]);
     }
     const HEADER: f64 = 80.0;
+    let mut scratch: Vec<u64> = Vec::new();
     while active.len() > max_clusters {
+        let bits: Vec<f64> = active.iter().map(|&i| hist_shannon_bits(&merged[i])).collect();
         let mut best = f64::INFINITY;
         let mut pair = (0usize, 1usize);
         for i in 0..active.len() {
             for j in (i + 1)..active.len() {
-                let a = &merged[active[i]];
-                let b = &merged[active[j]];
-                let mut sum = a.clone();
-                add_hist(&mut sum, b);
-                let extra =
-                    hist_shannon_bits(&sum) - hist_shannon_bits(a) - hist_shannon_bits(b) - HEADER;
+                scratch.clear();
+                scratch.extend_from_slice(&merged[active[i]]);
+                add_hist(&mut scratch, &merged[active[j]]);
+                let extra = hist_shannon_bits(&scratch) - bits[i] - bits[j] - HEADER;
                 if extra < best {
                     best = extra;
                     pair = (i, j);
@@ -3805,7 +3811,7 @@ fn hf_pass_tokens(
     bcm: &BlockCtxModel,
 ) -> Vec<HfGroupTokens> {
     let num_groups = width.div_ceil(GROUP_DIM) * height.div_ceil(GROUP_DIM);
-    let n_raw = bcm.n_clusters as usize * 3;
+    let n_raw = bcm.n_clusters as usize * (COEFF_KINDS + 1);
     let identity: Vec<u8> = (0..n_raw as u8).collect();
     map_indexed(num_groups, |g| {
         let (values, ctxs) = hf_group_stream(
@@ -3834,6 +3840,11 @@ fn hf_token_freqs(tok: &HfGroupTokens, n_raw: usize) -> Vec<Vec<u64>> {
             }
         },
     );
+    for f in &mut freqs {
+        while f.len() > 1 && f.last() == Some(&0) {
+            f.pop();
+        }
+    }
     freqs
 }
 
@@ -3841,7 +3852,7 @@ fn hist_from_hf_tokens(
     tokens: &[HfGroupTokens],
     bcm: &BlockCtxModel,
 ) -> (Vec<AnsHist>, Vec<u8>, Vec<u8>) {
-    let n_raw = bcm.n_clusters as usize * 3;
+    let n_raw = bcm.n_clusters as usize * (COEFF_KINDS + 1);
     let parts = map_slice(tokens, |tok| hf_token_freqs(tok, n_raw));
     let mut freqs = vec![vec![0u64; 32]; n_raw];
     for part in parts {
@@ -4257,7 +4268,7 @@ fn hf_push_slice(
             break;
         }
         let ctx = hf_coeff_ctx(left, scan, prev, nblog);
-        let kind = 1 + u8::from(ctx >= HF_COEFF_SPLIT);
+        let kind = coeff_kind(ctx);
         values.push(pack_signed(v));
         ctxs.push(assign[raw_hf_ctx(bc, kind)]);
         prev = v != 0;
