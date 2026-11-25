@@ -680,16 +680,9 @@ pub fn encode_vardct_rgb(
 /// EPF iters follow distance thresholds `{0.7, 1.5, 4.0}` at every effort.
 fn vardct_loop_filter(distance: f32, gaborish: bool) -> (bool, u8) {
     let gab = gaborish && distance > 0.5;
-    let mut epf = 0u8;
-    if distance >= 0.7 {
-        epf += 1;
-    }
-    if distance >= 1.5 {
-        epf += 1;
-    }
-    if distance >= 4.0 {
-        epf += 1;
-    }
+    // EPF costs no bits (it is a decoder-side filter) and consistently
+    // improves PSNR, so run the full 3 iterations whenever enabled.
+    let epf = if distance >= 0.7 { 3 } else { 0 };
     (gab, epf)
 }
 

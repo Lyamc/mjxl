@@ -188,6 +188,12 @@ and `bike.png` PSNR improves 37.40 → 37.95 dB at essentially the same rate;
 `kodim23` 40.00 → 40.16 dB. No image regressed and all tests pass.
 libjxl remained ahead at this point (0.416 bpp @ 46.44 dB on the photo).
 
+**Full EPF iterations (kept).** `vardct_loop_filter` wrote 1 EPF iteration at
+d=1; libjxl uses up to 3. EPF is a decoder-side filter and costs no bits, so
+running all 3 when enabled is a free PSNR gain: photo 44.55 → **44.87 dB**,
+bike 38.03 → **38.13**, kodim23 39.59 → **39.71**, at identical bitrates.
+Validated at d=0.5/1/1.5/2 — never worse.
+
 **Masking-aware quant feedback (kept).** A DCT-domain feedback pass at effort
 5+ computes per-block quantisation error normalised by local signal energy
 (energy normalisation = a crude masking model: busy blocks with large raw
