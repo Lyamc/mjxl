@@ -211,6 +211,16 @@ libjxl within 0.05 dB on all three test images:
 Rate is still 13–23 % above libjxl at this point; the earlier 0.403 bpp @
 44.87 dB setting is more rate-efficient but further from libjxl's PSNR.
 
+Coordinated nnz-context implementation (attempted, reverted): I replicated
+the decoder's 37-way neighbour prediction in `hf_group_stream` with
+per-column nnz grids (current/previous row) and wired a split ANS cluster map.
+With one cluster the stream is bit-identical; with 2+ clusters the decoder
+rejects it (`too many zeros in varblock HF coefficient` / `InvalidAnsStream`)
+even on a single-group image, so the encoder's `block_ctx` must differ from
+jxl-oxide's `block_ctx_map[idx]` for the per-block cluster selection. Fixing
+this requires changing jxl-oxide's `write_hf_coeff` state machine, which is a
+vendored dependency. Reverted.
+
 Decoder-style nnz prediction contexts (tested, reverted): the jxl-oxide
 decoder selects one of 37 nnz contexts per block from a neighbour prediction;
 our encoder collapsed all 37 to one ANS cluster. I wired full prediction into
