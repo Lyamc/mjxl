@@ -3291,21 +3291,30 @@ fn greedy_cluster(freqs: &[Vec<u64>], max_clusters: usize) -> (Vec<Vec<u64>>, Ve
     }
     const HEADER: f64 = 80.0;
     let mut scratch: Vec<u64> = Vec::new();
+    let mut bits: Vec<f64> = (0..n).map(|i| hist_shannon_bits(&merged[i])).collect();
+    let inf = vec![f64::INFINITY; n];
+    let mut costs = vec![inf; n];
+    let pair_cost =
+        |x: usize, y: usize, merged: &[Vec<u64>], scratch: &mut Vec<u64>, bits: &[f64]| -> f64 {
+            scratch.clear();
+            scratch.extend_from_slice(&merged[x]);
+            add_hist(scratch, &merged[y]);
+            hist_shannon_bits(scratch) - bits[x] - bits[y] - HEADER
+        };
+    for i in 0..active.len() {
+        for j in (i + 1)..active.len() {
+            let (a, b) = (active[i], active[j]);
+            costs[a][b] = pair_cost(a, b, &merged, &mut scratch, &bits);
+        }
+    }
     while active.len() > max_clusters {
-        let bits: Vec<f64> = active
-            .iter()
-            .map(|&i| hist_shannon_bits(&merged[i]))
-            .collect();
         let mut best = f64::INFINITY;
         let mut pair = (0usize, 1usize);
         for i in 0..active.len() {
             for j in (i + 1)..active.len() {
-                scratch.clear();
-                scratch.extend_from_slice(&merged[active[i]]);
-                add_hist(&mut scratch, &merged[active[j]]);
-                let extra = hist_shannon_bits(&scratch) - bits[i] - bits[j] - HEADER;
-                if extra < best {
-                    best = extra;
+                let c = costs[active[i]][active[j]];
+                if c < best {
+                    best = c;
                     pair = (i, j);
                 }
             }
@@ -3317,6 +3326,19 @@ fn greedy_cluster(freqs: &[Vec<u64>], max_clusters: usize) -> (Vec<Vec<u64>>, Ve
         add_hist(&mut merged[a], &src);
         parent[b] = a;
         active.swap_remove(j);
+        // Only costs involving the merged root change; cache the rest.
+        bits[a] = hist_shannon_bits(&merged[a]);
+        for &k in &active {
+            if k != a {
+                let c = pair_cost(a, k, &merged, &mut scratch, &bits);
+                costs[a][k] = c;
+                costs[k][a] = c;
+            }
+        }
+        for k in 0..n {
+            costs[b][k] = f64::INFINITY;
+            costs[k][b] = f64::INFINITY;
+        }
     }
     fn find(parent: &mut [usize], mut x: usize) -> usize {
         while parent[x] != x {

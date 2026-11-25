@@ -267,6 +267,22 @@ PSNR matches within 0.1 dB on all three; bpp is 9 % (photo) and 15–16 %
 (bike, kodim23) above libjxl. DCT8-only helped bike/kodim ~1–3 % at matched
 PSNR but hurt photo, so it was not made a default.
 
+Performance of the 16-kind change (measured with `mjxl bench -m vardct -e 7`,
+Y4M input, median of 15): the naive `greedy_cluster` recomputed every pair
+cost on every merge, so 255 raw contexts cost 2.5× encode time. Caching the
+pair-cost matrix and updating only pairs involving the merged root restored
+most of it. Same decisions, effectively identical streams (<0.04 % bytes):
+
+| bench | 2 kinds (before) | 16 kinds, naive | 16 kinds, cached |
+|---|---|---|---|
+| photo encode | 23.5 ms | 26.9 ms | 25.2 ms |
+| bike encode  | 105.0 ms | 275.6 ms | 113.6 ms |
+| kodim23 encode | 24.0 ms | 34.3 ms | 29.1 ms |
+| decode | unchanged | unchanged | unchanged |
+
+Net: ~4–5 % smaller streams for 7–21 % more encode time; decode unchanged.
+Kept as a worthwhile trade.
+
 sqrt coefficient-kind buckets (kept): mapping the raw coefficient context
 through sqrt before splitting into 16 kinds gives slightly finer
 discrimination where most tokens live; ~0.1% smaller on all three images at
