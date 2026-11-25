@@ -211,6 +211,10 @@ libjxl within 0.05 dB on all three test images:
 Rate is still 13–23 % above libjxl at this point; the earlier 0.403 bpp @
 44.87 dB setting is more rate-efficient but further from libjxl's PSNR.
 
+LF prefix-code smoothing (tested, no effect): removing the same +1 heuristic
+from `finish_code` (the LF/DC prefix code) changed no byte counts on any test
+image; coefficient orders are already learned from zero counts. Reverted.
+
 ANS histogram smoothing (kept): `finish_ans` added +1 to the first 19
 symbols, distorting the measured distribution. Removing it is ~0.8 % smaller
 at identical PSNR on photo (0.475→0.471 bpp), negligible on bike/kodim;
