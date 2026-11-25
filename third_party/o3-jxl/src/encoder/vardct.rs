@@ -3852,7 +3852,9 @@ fn hist_from_hf_tokens(
             }
         }
     }
-    let (merged, assign) = greedy_cluster(&freqs, 8);
+    // 16 clusters: the histogram headers pay for themselves at effort 7
+    // (~1% smaller than 8, saturating beyond 16).
+    let (merged, assign) = greedy_cluster(&freqs, 16);
     let map = hf_cluster_map(&assign, bcm.n_clusters as usize);
     let hists = merged.into_iter().map(finish_ans).collect();
     (hists, map, assign)

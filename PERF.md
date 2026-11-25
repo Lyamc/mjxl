@@ -211,6 +211,12 @@ libjxl within 0.05 dB on all three test images:
 Rate is still 13–23 % above libjxl at this point; the earlier 0.403 bpp @
 44.87 dB setting is more rate-efficient but further from libjxl's PSNR.
 
+HF entropy clustering (kept): `hist_from_hf_tokens` clustered raw contexts
+into 8 ANS histograms; 16 costs only slightly more in headers and is ~1 %
+smaller at identical PSNR (saturates beyond 16). Measured e7/d=1: photo
+0.480→0.475 bpp, bike 2.846→2.835, kodim23 1.598→1.588, all at unchanged
+PSNR.
+
 Rate-reduction knobs tested at matched PSNR (all reverted): DC scale 1.6–2.5
 raised both rate and PSNR on photo and did not help bike/kodim; refiner
 iterations 1/3 were no better than 2; quant-matrix scales (X/Y/B 0.6–1.2) and
