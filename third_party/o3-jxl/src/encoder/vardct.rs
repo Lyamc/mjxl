@@ -3164,9 +3164,9 @@ fn finish_ans(mut freqs: Vec<u64>) -> AnsHist {
         freqs.resize(1, 0);
         freqs[0] = 1;
     }
-    for slot in freqs.iter_mut().take(19) {
-        *slot = slot.saturating_add(1);
-    }
+    // No smoothing: adding 1 to the first 19 symbols slightly distorts the
+    // measured distribution (and costs ~0.8% rate at effort 7). Zero-count
+    // symbols are handled by AnsHist::from_freqs directly.
     AnsHist::from_freqs(&freqs)
 }
 

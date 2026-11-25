@@ -211,6 +211,11 @@ libjxl within 0.05 dB on all three test images:
 Rate is still 13–23 % above libjxl at this point; the earlier 0.403 bpp @
 44.87 dB setting is more rate-efficient but further from libjxl's PSNR.
 
+ANS histogram smoothing (kept): `finish_ans` added +1 to the first 19
+symbols, distorting the measured distribution. Removing it is ~0.8 % smaller
+at identical PSNR on photo (0.475→0.471 bpp), negligible on bike/kodim;
+bitstream still decodes with `djxl`, all tests pass.
+
 HF entropy clustering (kept): `hist_from_hf_tokens` clustered raw contexts
 into 8 ANS histograms; 16 costs only slightly more in headers and is ~1 %
 smaller at identical PSNR (saturates beyond 16). Measured e7/d=1: photo
