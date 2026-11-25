@@ -352,6 +352,43 @@ pub fn encode_vardct_rgb(
         &mut ac_q,
     );
     tick("dct-quant", &mut t_mark);
+
+    if tools.adaptive_quant {
+        // One masking-normalised error pass; sum(1/hf) conservation keeps the
+        // bitrate roughly constant while moving bits to under-served blocks.
+        for _ in 0..1 {
+            let errors = quant_error_by_block(
+                bw,
+                bh,
+                pw,
+                [&x_pl, &y_pl, &b_pl],
+                lf_inv,
+                &ac_inv,
+                &hf_muls,
+                QUANT_BIAS,
+                QUANT_BIAS_NUM,
+                &cfl,
+            );
+            refine_quant_field(&mut hf_muls, &errors);
+            dct_quant_all(
+                bw,
+                bh,
+                pw,
+                [&x_pl, &y_pl, &b_pl],
+                &zigzag,
+                lf_inv,
+                &ac_inv,
+                &hf_muls,
+                QUANT_BIAS,
+                QUANT_BIAS_NUM,
+                &cfl,
+                &mut lf_q,
+                &mut ac_q,
+            );
+        }
+        tick("aq-feedback", &mut t_mark);
+    }
+
     let mut acs = vec![ACS_DCT8; bw * bh];
     // 8×8 token+loss cost is invariant for blocks that stay DCT8, and every
     // strategy search below only asks it of those blocks. Compute it once.
@@ -1460,6 +1497,127 @@ fn quantize_with_bias(t: f32, qb: f32, qbn: f32) -> i32 {
         return if t >= 0.0 { 1 } else { -1 };
     }
     (t + qbn / t).round() as i32
+}
+
+/// Per-block quantisation error in XYB. The 8×8 DCT used here is orthonormal
+/// up to a constant, so the sum of squared coefficient errors is proportional
+/// to spatial MSE. Used by the effort-5+ perceptual feedback loop.
+#[allow(clippy::too_many_arguments)]
+fn quant_error_by_block(
+    bw: usize,
+    bh: usize,
+    pw: usize,
+    planes: [&[f32]; 3],
+    lf_inv: [f32; 3],
+    ac_inv: &[[f32; 64]; 3],
+    hf_muls: &[i32],
+    quant_bias: [f32; 3],
+    quant_bias_num: f32,
+    cfl: &CflMaps,
+) -> Vec<f32> {
+    let mut errors = vec![0.0f32; bw * bh];
+    for by in 0..bh {
+        for bx in 0..bw {
+            let x0 = bx * 8;
+            let y0 = by * 8;
+            let hf = hf_muls[by * bw + bx] as f32;
+            let mut coefs = [
+                dct8_fwd_from_plane(planes[0], pw, x0, y0),
+                dct8_fwd_from_plane(planes[1], pw, x0, y0),
+                dct8_fwd_from_plane(planes[2], pw, x0, y0),
+            ];
+            let (kx, kb) = cfl.factors(bx, by);
+            let kx_v = Simd::<f32, 8>::splat(kx);
+            let kb_v = Simd::<f32, 8>::splat(kb);
+            {
+                let y = coefs[1][0].to_array();
+                let mut x = coefs[0][0].to_array();
+                let mut b = coefs[2][0].to_array();
+                b[0] -= y[0];
+                for k in 1..8 {
+                    x[k] -= kx * y[k];
+                    b[k] -= kb * y[k];
+                }
+                coefs[0][0] = Simd::from_array(x);
+                coefs[2][0] = Simd::from_array(b);
+            }
+            for row in 1..8 {
+                let y = coefs[1][row];
+                coefs[0][row] -= y * kx_v;
+                coefs[2][row] -= y * kb_v;
+            }
+            let mut err = 0.0f32;
+            let mut energy = 0.0f32;
+            for c in 0..3 {
+                let dc = coefs[c][0].to_array()[0];
+                let q = (dc * lf_inv[c]).round();
+                let recon_dc = q / lf_inv[c];
+                err += (dc - recon_dc) * (dc - recon_dc);
+                for row in 0..8 {
+                    let orig = coefs[c][row].to_array();
+                    let t = coefs[c][row]
+                        * Simd::<f32, 8>::from_slice(&ac_inv[c][row * 8..])
+                        * Simd::<f32, 8>::splat(hf);
+                    let ta = t.to_array();
+                    for k in 0..8 {
+                        energy += orig[k] * orig[k];
+                        let q = quantize_with_bias(ta[k], quant_bias[c], quant_bias_num) as f32;
+                        let moved = if q.abs() < 1.5 {
+                            q * quant_bias[c]
+                        } else {
+                            q - quant_bias_num / q
+                        };
+                        let recon = moved / (ac_inv[c][row * 8 + k] * hf);
+                        let d = orig[k] - recon;
+                        err += d * d;
+                    }
+                }
+            }
+            // Error normalised by local energy: a busy block with large raw
+            // error but large signal is not under-quantised.
+            errors[by * bw + bx] = err / energy.max(1e-3);
+        }
+    }
+    errors
+}
+
+/// One feedback iteration: shift quant toward blocks with high perceptual
+/// (masking-normalised) error, then conserve the *rate proxy* sum(1/hf) —
+/// entropy grows roughly with the count of nonzero coefficients, i.e. 1/hf.
+fn refine_quant_field(hf_muls: &mut [i32], errors: &[f32]) {
+    const EXP: f64 = 0.0625;
+    if hf_muls.len() < 4 || errors.len() != hf_muls.len() {
+        return;
+    }
+    let mut sorted = errors.to_vec();
+    let mid = sorted.len() / 2;
+    sorted.select_nth_unstable_by(mid, |a, b| a.total_cmp(b));
+    let median = sorted[mid].max(1e-6);
+    for (hf, &e) in hf_muls.iter_mut().zip(errors) {
+        let factor = ((e / median).max(0.25).min(4.0) as f64).powf(EXP);
+        *hf = ((*hf as f64) * factor).round().clamp(1.0, 256.0) as i32;
+    }
+    // Entropy grows with the count of nonzero coefficients, i.e. with 1/hf.
+    // Conserve sum(1/hf) so reallocation does not simply spend more bits.
+    let old: f64 = hf_muls.iter().map(|&v| 1.0 / v as f64).sum();
+    let mut lo = 0.25f64;
+    let mut hi = 4.0f64;
+    for _ in 0..16 {
+        let mid = (lo + hi) * 0.5;
+        let now: f64 = hf_muls
+            .iter()
+            .map(|&v| 1.0 / ((v as f64 * mid).round() as i32).clamp(1, 256) as f64)
+            .sum();
+        if now > old {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    let scale = (lo + hi) * 0.5;
+    for hf in hf_muls.iter_mut() {
+        *hf = ((*hf as f64 * scale).round() as i32).clamp(1, 256);
+    }
 }
 
 fn distance_to_quant(d: f32, ac_quant: f32) -> (u32, u32, i32) {

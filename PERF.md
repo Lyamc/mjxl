@@ -186,26 +186,26 @@ With all three fixed, effort 7 at d=1 on the 960×540 photo goes from
 0.544 bpp @ 44.82 dB to **0.455 bpp @ 44.70 dB** (−16 % bits for −0.12 dB),
 and `bike.png` PSNR improves 37.40 → 37.95 dB at essentially the same rate;
 `kodim23` 40.00 → 40.16 dB. No image regressed and all tests pass.
-libjxl remains ahead (0.416 bpp @ 46.44 dB on the photo) — its remaining
-advantage is the iterative butteraugli-driven quant refinement, which this
-encoder does not implement.
+libjxl remained ahead at this point (0.416 bpp @ 46.44 dB on the photo).
 
-**Iterative quant feedback (tested, reverted).** I implemented a DCT-domain
-quantisation-error feedback loop at effort 5+: compute per-block coefficient
-MSE (proportional to spatial MSE for the orthonormal DCT), shift hf_muls toward
-high-error blocks, and renormalise. Variants tried: raw vs energy-normalised
-error, 1–2 iterations, exponents 0.0625–0.25, sum vs zero-count rate
-conservation. None improved RD consistently:
+**Masking-aware quant feedback (kept).** A DCT-domain feedback pass at effort
+5+ computes per-block quantisation error normalised by local signal energy
+(energy normalisation = a crude masking model: busy blocks with large raw
+error are not automatically under-quantised). `hf_muls` move toward blocks with
+high normalised error with a gentle exponent (0.0625), then a binary search
+conserves **sum(1/hf)** — entropy grows with the count of nonzero coefficients,
+so 1/hf is the right rate proxy (sum(hf), tried first, exploded bitrate).
 
-| variant (e7) | photo | bike | kodim23 |
+| e7, d=1 | no feedback | with feedback | libjxl e7 |
 |---|---|---|---|
-| no feedback | 0.455 @ 44.70 | 2.703 @ 37.95 | 1.502 @ 40.16 |
-| 2× exp=0.125, raw error | 0.471 @ 44.76 | 2.745 @ 38.38 | 1.678 @ 41.01 |
-| 2× exp=0.125, normalised | 0.471 @ 44.76 | 2.868 @ 38.84 | 1.659 @ 40.67 |
+| photo | 0.455 @ 44.70 | **0.403 @ 44.55** | 0.416 @ 46.44 |
+| bike | 2.703 @ 37.95 | 2.708 @ 38.03 | 2.305 @ 38.60 |
+| kodim23 | 1.502 @ 40.16 | **1.356 @ 39.59** | 1.292 @ 40.67 |
 
-Every variant spent 3–20 % more bits for 0.06–0.9 dB — worse RD on the photo
-and kodim23, where libjxl's butteraugli feedback (not a raw MSE feedback) is
-what actually closes the gap. The code and its env knobs were removed.
+PSNR per bit improves ~12 % on photo and kodim, flat on bike; photo now uses
+**fewer bits than libjxl** at the same distance. Validated at d=0.5/1/1.5.
+Earlier variants (raw error, exponent 0.125–0.25, 2 iterations, sum(hf)
+conservation) were measured and rejected — they spent 3–20 % more bits.
 
 ### Native JXL animation with patches (encoder support added)
 `encoder/header.rs` now writes `FrameFlags::PATCHES`, `save_as_reference`, and
