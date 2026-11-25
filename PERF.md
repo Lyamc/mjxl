@@ -243,6 +243,11 @@ Num-nonzero context scaling (tested, reverted): scaling the nnz context table
 had no rate effect at ≥1.0 and crashed below 1.0 (context id past the
 decoder's fixed 495-table). No rate win.
 
+sqrt coefficient-kind buckets (kept): mapping the raw coefficient context
+through sqrt before splitting into 16 kinds gives slightly finer
+discrimination where most tokens live; ~0.1% smaller on all three images at
+unchanged PSNR.
+
 Raw HF contexts widened to u16 so cluster counts beyond 16 remain possible
 (48 kinds gave photo 0.449 / bike 2.646 / kodim23 1.464 bpp at unchanged PSNR,
 but bike encode time grows from ~3 s to ~5 s; 16 kept as the balance). Merged

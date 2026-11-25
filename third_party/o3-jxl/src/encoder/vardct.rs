@@ -3225,7 +3225,10 @@ const COEFF_NUM_NONZERO_CONTEXT: [u32; 63] = [
 const COEFF_KINDS: usize = 16;
 
 fn coeff_kind(ctx: usize) -> u8 {
-    1 + ((ctx * COEFF_KINDS) / 458) as u8
+    // sqrt buckets give slightly finer discrimination at low raw-context ids,
+    // where most coefficient tokens live (~0.1% smaller on all test images).
+    let u = (ctx as f64 / 458.0).sqrt();
+    1 + ((u * COEFF_KINDS as f64) as usize).min(COEFF_KINDS - 1) as u8
 }
 
 fn raw_hf_ctx(bc: u8, kind: u8) -> usize {
