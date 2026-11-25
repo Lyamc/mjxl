@@ -173,6 +173,23 @@ MA-tree learning rather than a scalar tweak.
 tests pass. Encoded bytes and PSNR are bit-identical to before the changes
 on both the 16-frame clip and a single frame.
 
+### VarDCT adaptive-quant fixes (kept)
+The VarDCT AQ field had three mismatches against libjxl's
+`enc_adaptive_quantization.cc` / `quantizer.cc`:
+
+1. Blue modulation was **added** to the exponent; libjxl uses `min(hf, blue)`.
+2. The exponent used `e^x`; libjxl uses `2^x` (`FastPow2f(x*log2e)`).
+3. `global_scale` came from a hardcoded `0.39/d`; libjxl derives it from the
+   **actual AQ field median and MAD** (`Quantizer::SetQuantField`).
+
+With all three fixed, effort 7 at d=1 on the 960×540 photo goes from
+0.544 bpp @ 44.82 dB to **0.455 bpp @ 44.70 dB** (−16 % bits for −0.12 dB),
+and `bike.png` PSNR improves 37.40 → 37.95 dB at essentially the same rate;
+`kodim23` 40.00 → 40.16 dB. No image regressed and all tests pass.
+libjxl remains ahead (0.416 bpp @ 46.44 dB on the photo) — its remaining
+advantage is the iterative butteraugli-driven quant refinement, which this
+encoder does not implement.
+
 ### Native JXL animation with patches (encoder support added)
 `encoder/header.rs` now writes `FrameFlags::PATCHES`, `save_as_reference`, and
 `save_before_ct`; `encoder/mod.rs` writes the `Patches` ANS structure at the

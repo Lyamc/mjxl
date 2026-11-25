@@ -258,22 +258,34 @@ pub fn encode_vardct_rgb(
     // libjxl `InitialQuantField` runs on *pre-gaborish* XYB. Hare+ sets
     // `global_scale` from `0.39/d` (not the AQ-field median). Gab-off scales
     // the IQF distance by 0.62.
+    // libjxl derives `global_scale` from the actual AQ field median and its
+    // median absolute deviation. A fixed `0.39/d` over/under-quantises on
+    // images whose masking field differs from the nominal value.
+    let quant_dc = initial_quant_dc(distance);
+    let mut aq_field: Option<Vec<f32>> = None;
     let (global_scale, quant_lf, base_hf_mul) = if tools.adaptive_quant {
-        distance_to_quant_hare(distance)
+        let iqf_d = if tools.gaborish {
+            distance
+        } else {
+            distance * 0.62
+        };
+        let (qf, mask1x1_pre) = initial_quant_field(&x_pl, &y_pl, &b_pl, pw, ph, bw, bh, iqf_d);
+        let (median, mad) = median_and_mad(&qf);
+        aq_field = Some(qf);
+        let _ = mask1x1_pre;
+        compute_global_scale_and_quant(quant_dc, median, mad)
     } else {
         distance_to_quant(distance, 0.79)
     };
     // The full-frame 1×1 mask is only read by block-size search and adaptive quant.
     let block_search = tools.dct4 || ((tools.dct16 || tools.dct32) && !no_varblock);
-    let (mut hf_muls, mask1x1) = if tools.adaptive_quant {
-        let iqf_d = if gab { distance } else { distance * 0.62 };
-        let (qf, mask) = initial_quant_field(&x_pl, &y_pl, &b_pl, pw, ph, bw, bh, iqf_d);
+    let (mut hf_muls, mask1x1) = if let Some(qf) = aq_field {
         let inv_gs = 65536.0 / global_scale as f32;
-        let hf = qf
+        let hf: Vec<i32> = qf
             .into_iter()
             .map(|q| (q * inv_gs + 0.5).clamp(1.0, 256.0) as i32)
             .collect();
-        (hf, mask)
+        (hf, vec![1.0f32; pw * ph])
     } else if block_search {
         (vec![base_hf_mul; bw * bh], vec![1.0f32; pw * ph])
     } else {
@@ -644,10 +656,18 @@ fn vardct_loop_filter(distance: f32, gaborish: bool) -> (bool, u8) {
     (gab, epf)
 }
 
-/// libjxl `ComputeGlobalScaleAndQuant` at Hare+: median = `0.39/d`, mad = 0.
-fn distance_to_quant_hare(d: f32) -> (u32, u32, i32) {
-    let d = d.clamp(0.01, 25.0);
-    compute_global_scale_and_quant(initial_quant_dc(d), 0.39 / d, 0.0)
+/// Median and median absolute deviation of the AQ field, as libjxl's
+/// `Quantizer::SetQuantField` computes before deriving `global_scale`.
+fn median_and_mad(values: &[f32]) -> (f32, f32) {
+    let mut v = values.to_vec();
+    let mid = v.len() / 2;
+    v.select_nth_unstable_by(mid, |a, b| a.total_cmp(b));
+    let median = v[mid];
+    for x in &mut v {
+        *x = (*x - median).abs();
+    }
+    v.select_nth_unstable_by(mid, |a, b| a.total_cmp(b));
+    (median, v[mid])
 }
 
 fn compute_global_scale_and_quant(quant_dc: f32, quant_median: f32, mad: f32) -> (u32, u32, i32) {
@@ -1290,11 +1310,14 @@ fn initial_quant_field(
         let y = by * 8;
         for bx in 0..bw {
             let x = bx * 8;
-            let mut out_val = compute_mask(aq_row[bx]);
-            out_val += hf_modulation(y_pl, pw, x, y, ph);
-            out_val += gamma_modulation(x_pl, y_pl, pw, x, y);
-            out_val += blue_modulation(x_pl, y_pl, b_pl, pw, x, y);
-            aq_row[bx] = out_val.exp() * mul + add;
+            let base = compute_mask(aq_row[bx]);
+            let mask = base + gamma_modulation(x_pl, y_pl, pw, x, y);
+            // libjxl PerBlockModulations: HF modulation is additive, blue is
+            // a *minimum* (blue blocks get no extra bits), then 2**exponent.
+            let hf = mask + hf_modulation(y_pl, pw, x, y, ph);
+            let blue = mask + blue_modulation(x_pl, y_pl, b_pl, pw, x, y);
+            let out_val = hf.min(blue);
+            aq_row[bx] = (out_val * std::f32::consts::LN_2).exp() * mul + add;
         }
     });
     // libjxl `mask1x1`: 1 / (log1p(|γ·laplacian|) + 0.01), used by EstimateEntropy.
